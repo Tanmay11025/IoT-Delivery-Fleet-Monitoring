@@ -8,12 +8,6 @@ void handle_sigint(int) {
     shutdown_requested = true;
 }
 
-// Keep routine status messages consistent and easy to scan in the terminal.
-void log_info(const string& message) {
-    cout << "[INFO] " << message << '\n';
-}
-
-
 TCPServer::TCPServer(int port, int backlog) : port(port), backlog(backlog) {}
 
 TCPServer::~TCPServer() {stop();}
@@ -70,7 +64,8 @@ bool TCPServer::start() {
         return false;
     }
 
-    log_info("Listening on port " + to_string(port) + " with backlog " + to_string(backlog));
+    // Log that the server is now listening with both port and backlog configuration.
+    Logger::info("Listening on port " + to_string(port) + " with backlog " + to_string(backlog));
     return accept_loop();
 }
 
@@ -110,15 +105,17 @@ void TCPServer::stop() {
 
 // implementation of ClientConnection
 
-bool ClientConnection::ClientInitiate () {
+// Initialize the client connection by validating the file descriptor, logging the connection,
+// and passing control to handle_client() for echo protocol processing.
+void ClientConnection::ClientInitiate() {
     if (fd == -1) {
         perror("accept");
-        return false;
+        return;
     }
 
-    log_info("Client connected: fd=" + to_string(fd));
+    // Log each new client connection with its file descriptor for debugging and monitoring.
+    Logger::info("Client connected: fd=" + to_string(fd));
     handle_client();
-    return true;
 }
 
 void ClientConnection::handle_client() {

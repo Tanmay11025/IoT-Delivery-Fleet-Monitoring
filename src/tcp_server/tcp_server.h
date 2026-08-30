@@ -8,15 +8,13 @@
 #include <sstream>
 #include <csignal>
 #include <string>
+#include "../core/logger.h"
 
 using namespace std;
 #pragma once
 
 // Set by the SIGINT handler when the user presses Ctrl+C.
 void handle_sigint(int);
-
-// Print normal server events with a consistent log level prefix.
-void log_info(const string& message);
 
 class TCPServer {
 public:
@@ -64,7 +62,7 @@ public:
     ClientConnection(const ClientConnection&) = delete;
     ClientConnection& operator=(const ClientConnection&) = delete;
 
-    bool ClientInitiate() {};
-    // Read data from one client and send the same bytes back
+    // Initialize and handle the client connection; logs connection info and processes I/O.
+    void ClientInitiate();
     void handle_client();
 };
