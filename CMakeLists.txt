@@ -8,6 +8,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 add_executable(message_gateway
 	src/main.cpp
+	src/epoll_loop/epoll_loop.cpp
 	src/tcp_server/tcp_server.cpp
 )
 

@@ -8,8 +8,10 @@
 #include <fcntl.h>
 #include <sstream>
 #include <csignal>
+#include <set>
 #include <string>
 #include "../core/logger.h"
+#include "../epoll_loop/epoll_loop.h"
 
 using namespace std;
 #pragma once
@@ -46,27 +48,26 @@ private:
     // Create and bind the listening socket
     bool setup();
 
-    // Accept clients one at a time and pass each one to handle_client()
+    // Run epoll and dispatch listening/client socket events.
     bool accept_loop();
+
+    // Decide what to do when one descriptor becomes ready.
+    void handle_event(EpollLoop& loop, int fd, unsigned int events);
+
+    // Accept every queued connection without blocking the event loop.
+    void accept_clients(EpollLoop& loop);
+
+    // Read all available client data and echo it back.
+    void handle_client(EpollLoop& loop, int client_fd);
+
+    // Remove a client from epoll and release its socket.
+    void close_client(EpollLoop& loop, int client_fd);
 
     // -1 means that no listening socket is currently open
     int server_fd = -1;
     int port;
     int backlog;
-};
 
-// handles client
-class ClientConnection {
-    int fd;
-public: 
-    ClientConnection(int f) : fd(f) {}
-    ~ClientConnection() {close(fd);}
-
-    // A connection owns its socket and cannot be copied safely.
-    ClientConnection(const ClientConnection&) = delete;
-    ClientConnection& operator=(const ClientConnection&) = delete;
-
-    // Initialize and handle the client connection; logs connection info and processes I/O.
-    void ClientInitiate();
-    void handle_client();
+    // Keep client descriptors alive between epoll events.
+    set<int> client_fds;
 };
