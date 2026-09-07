@@ -5,6 +5,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 #include <cstdlib>
+#include <fcntl.h>
 #include <sstream>
 #include <csignal>
 #include <string>
@@ -15,6 +16,9 @@ using namespace std;
 
 // Set by the SIGINT handler when the user presses Ctrl+C.
 void handle_sigint(int);
+
+// Configure a file descriptor so I/O returns immediately when it would block.
+bool set_nonblocking(int fd);
 
 class TCPServer {
 public:

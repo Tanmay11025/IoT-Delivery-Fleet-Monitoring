@@ -8,6 +8,23 @@ void handle_sigint(int) {
     shutdown_requested = true;
 }
 
+bool set_nonblocking(int fd) {
+    // Preserve the descriptor's existing flags before adding O_NONBLOCK.
+    const int flags = fcntl(fd, F_GETFL, 0);
+    if (flags == -1) {
+        perror("fcntl(F_GETFL)");
+        return false;
+    }
+
+    // Add nonblocking mode without discarding any existing descriptor flags.
+    if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) == -1) {
+        perror("fcntl(F_SETFL)");
+        return false;
+    }
+
+    return true;
+}
+
 TCPServer::TCPServer(int port, int backlog) : port(port), backlog(backlog) {}
 
 TCPServer::~TCPServer() {stop();}
