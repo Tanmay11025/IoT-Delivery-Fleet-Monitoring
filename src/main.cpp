@@ -1,4 +1,4 @@
-#include "tcp_server/tcp_server.h"
+#include "network/tcp_server.h"
 
 // Convert one command-line value to an integer and reject invalid text.
 bool parse_argument(const char* value, const char* name, int& result) {

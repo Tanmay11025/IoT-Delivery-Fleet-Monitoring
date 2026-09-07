@@ -8,10 +8,10 @@
 #include <fcntl.h>
 #include <sstream>
 #include <csignal>
-#include <set>
 #include <string>
 #include "../core/logger.h"
-#include "../epoll_loop/epoll_loop.h"
+#include "connection_manager.h"
+#include "epoll_loop.h"
 
 using namespace std;
 #pragma once
@@ -68,6 +68,6 @@ private:
     int port;
     int backlog;
 
-    // Keep client descriptors alive between epoll events.
-    set<int> client_fds;
+    // Keep client state alive between epoll events.
+    ConnectionManager connections;
 };

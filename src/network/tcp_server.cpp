@@ -108,7 +108,7 @@ bool TCPServer::accept_loop() {
         return false;
     }
 
-    // Pass each ready descriptor to the server's event handler.
+    // Level-triggered epoll: EPOLLIN stays ready until the socket is drained.
     return loop.run([this, &loop](int fd, unsigned int events) {
         handle_event(loop, fd, events);
     });
@@ -155,7 +155,7 @@ void TCPServer::accept_clients(EpollLoop& loop) {
             continue;
         }
 
-        client_fds.insert(client_fd);
+        connections.add(client_fd);
         Logger::info("Client connected: fd=" + to_string(client_fd));
     }
 }
@@ -198,7 +198,7 @@ void TCPServer::handle_client(EpollLoop& loop, int client_fd) {
 // Unregister a client socket and release its descriptor.
 void TCPServer::close_client(EpollLoop& loop, int client_fd) {
     loop.remove_fd(client_fd);
-    client_fds.erase(client_fd);
+    connections.remove(client_fd);
     close(client_fd);
 }
 
