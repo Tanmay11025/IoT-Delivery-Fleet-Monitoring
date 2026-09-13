@@ -1,11 +1,5 @@
 #include "epoll_loop.h"
 
-#include <cerrno>
-#include <csignal>
-#include <cstdio>
-#include <sys/epoll.h>
-#include <unistd.h>
-
 extern volatile sig_atomic_t shutdown_requested;
 
 // Create the epoll file descriptor used to monitor all registered sockets.
@@ -47,7 +41,7 @@ bool EpollLoop::remove_fd(int fd) {
 }
 
 // Wait for socket activity and call the server handler for each ready socket.
-bool EpollLoop::run(const std::function<void(int, unsigned int)>& callback) {
+bool EpollLoop::run(const function<void(int, unsigned int)>& callback) {
     if (epoll_fd == -1) {
         return false;
     }

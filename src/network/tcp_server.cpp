@@ -1,7 +1,5 @@
 #include "tcp_server.h"
 
-#include <cerrno>
-#include <sys/epoll.h>
 
 // Signal handlers should do as little work as possible, so they only set a
 // flag that the main server loop checks safely.
@@ -114,20 +112,31 @@ bool TCPServer::accept_loop() {
     });
 }
 
-// Handle one epoll event by choosing accept, close, or client-read logic.
+// Handle one epoll event by choosing accept, read, or close logic.
 void TCPServer::handle_event(EpollLoop& loop, int fd, unsigned int events) {
     if (fd == server_fd) {
-        accept_clients(loop);
+        if (events & (EPOLLERR | EPOLLHUP)) {
+            Logger::info("Listening socket failed; stopping server");
+            stop();
+            shutdown_requested = true;
+            return;
+        }
+
+        if (events & EPOLLIN) {
+            accept_clients(loop);
+        }
         return;
     }
 
-    if (events & (EPOLLERR | EPOLLHUP)) {
-        close_client(loop, fd);
-        return;
-    }
-
+    // Read first: a peer can send final bytes before it half-closes its side.
+    // handle_client drains the socket and closes it if read() reaches EOF.
     if (events & EPOLLIN) {
         handle_client(loop, fd);
+        return;
+    }
+
+    if (events & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) {
+        close_client(loop, fd);
     }
 }
 
@@ -150,13 +159,14 @@ void TCPServer::accept_clients(EpollLoop& loop) {
         }
 
         // Each client must also be nonblocking before it enters epoll.
-        if (!set_nonblocking(client_fd) || !loop.add_fd(client_fd, EPOLLIN)) {
+        if (!set_nonblocking(client_fd) ||
+            !loop.add_fd(client_fd, EPOLLIN | EPOLLRDHUP)) {
             close(client_fd);
             continue;
         }
 
         connections.add(client_fd);
-        Logger::info("Client connected: fd=" + to_string(client_fd));
+        Logger::info("Client connected: fd =" + to_string(client_fd));
     }
 }
 
@@ -211,5 +221,4 @@ void TCPServer::stop() {
         server_fd = -1;
     }
 }
-
 

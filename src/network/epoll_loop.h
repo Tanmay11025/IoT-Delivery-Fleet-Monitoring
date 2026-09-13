@@ -1,6 +1,13 @@
 #pragma once
 
 #include <functional>
+#include <cerrno>
+#include <csignal>
+#include <cstdio>
+#include <sys/epoll.h>
+#include <unistd.h>
+
+using namespace std;
 
 class EpollLoop {
 public:
@@ -17,7 +24,7 @@ public:
     bool remove_fd(int fd);
 
     // Wait for ready descriptors and pass each one to the callback.
-    bool run(const std::function<void(int, unsigned int)>& callback);
+    bool run(const function<void(int, unsigned int)>& callback);
 
 private:
     int epoll_fd = -1;

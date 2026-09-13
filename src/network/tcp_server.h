@@ -1,4 +1,3 @@
-
 #include <cstdint>
 #include <iostream>
 #include <netinet/in.h>
@@ -9,6 +8,8 @@
 #include <sstream>
 #include <csignal>
 #include <string>
+#include <cerrno>
+#include <sys/epoll.h>
 #include "../core/logger.h"
 #include "connection_manager.h"
 #include "epoll_loop.h"
@@ -32,7 +33,7 @@ public:
 
     // A server owns its socket and cannot be copied safely.
     TCPServer(const TCPServer&) = delete;
-    TCPServer& operator=(const TCPServer&) = delete;
+    TCPServer& operator = (const TCPServer&) = delete;
 
     // Create the socket, begin listening, and accept clients until stopped.
     bool start();
