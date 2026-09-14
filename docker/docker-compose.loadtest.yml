@@ -1,0 +1,31 @@
+services:
+  gateway:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    command: ["./build/message_gateway", "8080", "65535", "0"]
+    ulimits:
+      nofile:
+        soft: 200000
+        hard: 200000
+    ports:
+      - "8080:8080"
+
+  loadtest:
+    image: python:3.12-alpine
+    depends_on:
+      - gateway
+    sysctls:
+      net.ipv4.ip_local_port_range: "1024 65535"
+    environment:
+      CONNECTIONS: ${CONNECTIONS:-1000}
+      DURATION: ${DURATION:-30}
+      LOADTEST_HOST: gateway
+      LOADTEST_PORT: 8080
+    ulimits:
+      nofile:
+        soft: 200000
+        hard: 200000
+    volumes:
+      - ../scripts/tcp_load_generator.py:/load_test.py:ro
+    command: ["python", "/load_test.py"]
