@@ -1,6 +1,7 @@
 #pragma once
 
 #include <functional>
+#include <atomic>
 #include <cerrno>
 #include <csignal>
 #include <cstdio>
@@ -8,6 +9,8 @@
 #include <unistd.h>
 
 using namespace std;
+
+extern atomic<bool> shutdown_requested;
 
 class EpollLoop {
 public:
@@ -22,6 +25,9 @@ public:
 
     // Stop watching a file descriptor.
     bool remove_fd(int fd);
+
+    // Change the events watched for a file descriptor.
+    bool modify_fd(int fd, unsigned int events);
 
     // Wait for ready descriptors and pass each one to the callback.
     bool run(const function<void(int, unsigned int)>& callback);

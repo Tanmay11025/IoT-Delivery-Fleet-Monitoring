@@ -1,7 +1,5 @@
 #include "epoll_loop.h"
 
-extern volatile sig_atomic_t shutdown_requested;
-
 // Create the epoll file descriptor used to monitor all registered sockets.
 EpollLoop::EpollLoop() : epoll_fd(epoll_create1(0)) {
     if (epoll_fd == -1) {
@@ -40,6 +38,20 @@ bool EpollLoop::remove_fd(int fd) {
     return true;
 }
 
+// Update one socket's interest mask without removing it from epoll.
+bool EpollLoop::modify_fd(int fd, unsigned int events) {
+    epoll_event event{};
+    event.events = events;
+    event.data.fd = fd;
+
+    if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, fd, &event) == -1) {
+        perror("epoll_ctl(MOD)");
+        return false;
+    }
+
+    return true;
+}
+
 // Wait for socket activity and call the server handler for each ready socket.
 bool EpollLoop::run(const function<void(int, unsigned int)>& callback) {
     if (epoll_fd == -1) {
@@ -47,8 +59,8 @@ bool EpollLoop::run(const function<void(int, unsigned int)>& callback) {
     }
 
     epoll_event events[64];
-    while (!shutdown_requested) {
-        const int event_count = epoll_wait(epoll_fd, events, 64, -1);
+    while (!shutdown_requested.load(memory_order_relaxed)) {
+        const int event_count = epoll_wait(epoll_fd, events, 64, 1000);
         if (event_count == -1) {
             if (errno == EINTR) {
                 continue;

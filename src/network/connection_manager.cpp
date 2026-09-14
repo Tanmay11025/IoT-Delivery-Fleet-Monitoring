@@ -2,7 +2,7 @@
 
 // Store a new client connection by its file descriptor.
 void ConnectionManager::add(int fd) {
-    connections[fd] = Connection{fd};
+    connections[fd] = Connection{fd, {}, false};
 }
 
 // Erase a client connection from the active connection list.
@@ -20,6 +20,6 @@ Connection* ConnectionManager::get(int fd) {
 }
 
 // Return how many client connections are currently active.
-std::size_t ConnectionManager::count() const {
+size_t ConnectionManager::count() const {
     return connections.size();
 }

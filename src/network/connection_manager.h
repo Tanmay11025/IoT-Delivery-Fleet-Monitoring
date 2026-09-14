@@ -1,10 +1,20 @@
 #pragma once
 
 #include <cstddef>
+#include <string>
 #include <unordered_map>
+
+using namespace std;
 
 struct Connection {
     int fd;
+    // Bytes waiting to be echoed. The offset prevents an O(n) erase after
+    // every partial send().
+    string outbound;
+    size_t outbound_offset = 0;
+    bool peer_closed = false;
+
+    size_t pending_bytes() const { return outbound.size() - outbound_offset; }
 };
 
 class ConnectionManager {
@@ -19,8 +29,8 @@ public:
     Connection* get(int fd);
 
     // Return the number of active clients.
-    std::size_t count() const;
+    size_t count() const;
 
 private:
-    std::unordered_map<int, Connection> connections;
+    unordered_map<int, Connection> connections;
 };

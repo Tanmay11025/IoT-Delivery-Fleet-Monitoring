@@ -1,13 +1,16 @@
 #include "tcp_server.h"
 
 
-// Signal handlers should do as little work as possible, so they only set a
-// flag that the main server loop checks safely.
-volatile sig_atomic_t shutdown_requested = false;
+
+// Signal handlers do no I/O or locking: they only update this shared flag.
+// The assertion keeps that signal-handler operation lock-free on supported
+// targets instead of silently falling back to an internal mutex.
+static_assert(atomic<bool>::is_always_lock_free);
+atomic<bool> shutdown_requested{false};
 
 // Request a clean event-loop shutdown when Ctrl+C is pressed.
 void handle_sigint(int) {
-    shutdown_requested = true;
+    shutdown_requested.store(true, memory_order_relaxed);
 }
 
 // Mark a descriptor nonblocking while preserving its existing flags.
@@ -28,28 +31,20 @@ bool set_nonblocking(int fd) {
     return true;
 }
 
-// Store the port and connection backlog used by this server.
-TCPServer::TCPServer(int port, int backlog) : port(port), backlog(backlog) {}
-
-// Stop the server and close its listening socket.
-TCPServer::~TCPServer() {stop();}
-
-// Create and bind the listening socket to the configured port.
-bool TCPServer::setup() {
-    // AF_INET selects IPv4 and SOCK_STREAM creates a reliable TCP socket.
-    server_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (server_fd == -1) {
+int create_reuseport_listener(int port, int backlog) {
+    const int listener_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (listener_fd == -1) {
         perror("socket");
-        return false;
+        return -1;
     }
 
     // Allow the port to be reused soon after the process is restarted.
     int option = 1;
-    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &option, sizeof(option)) == -1) {
-        close(server_fd);
-        server_fd = -1;
+    if (setsockopt(listener_fd, SOL_SOCKET, SO_REUSEADDR, &option, sizeof(option)) == -1 ||
+        setsockopt(listener_fd, SOL_SOCKET, SO_REUSEPORT, &option, sizeof(option)) == -1) {
         perror("setsockopt");
-        return false;
+        close(listener_fd);
+        return -1;
     }
 
     // sockaddr_in describes the local IPv4 address and TCP port to bind.
@@ -63,89 +58,149 @@ bool TCPServer::setup() {
     // INADDR_ANY listens on every local network interface.
     server_addr.sin_addr.s_addr = htonl(INADDR_ANY);
 
-    // Binding reserves the requested address and port for this socket.
-    if (bind(server_fd, (struct sockaddr*)(&server_addr), sizeof(server_addr)) == -1) {
-        close(server_fd);
-        server_fd = -1;
+    if (bind(listener_fd, reinterpret_cast<sockaddr*>(&server_addr), sizeof(server_addr)) == -1) {
         perror("bind");
-        return false;
+        close(listener_fd);
+        return -1;
     }
 
-    return true;
-}
-
-// Start listening, configure nonblocking mode, and enter the epoll loop.
-bool TCPServer::start() {
-    // Complete socket setup before putting the socket into listening mode.
-    if (!setup()) {
-        return false;
-    }
-
-    // listen() enables the operating system's queue for incoming connections.
-    if (listen(server_fd, backlog) == -1) {
+    if (listen(listener_fd, backlog) == -1) {
         perror("listen");
-        stop();
-        return false;
+        close(listener_fd);
+        return -1;
     }
 
-    // Both accept() and client reads must return instead of blocking.
-    if (!set_nonblocking(server_fd)) {
-        stop();
-        return false;
+    if (!set_nonblocking(listener_fd)) {
+        close(listener_fd);
+        return -1;
     }
 
-    // Log that the server is now listening with both port and backlog configuration.
-    Logger::info("Listening on port " + to_string(port) + " with backlog " + to_string(backlog));
-    return accept_loop();
+    return listener_fd;
 }
 
-// Register the listening socket and dispatch all ready socket events.
-bool TCPServer::accept_loop() {
+TCPServer::TCPServer(int port, int backlog, unsigned int worker_count)
+    : port(port),
+      backlog(backlog),
+      worker_count(worker_count == 0
+                       ? std::max(1u, std::thread::hardware_concurrency())
+                       : worker_count) {}
+
+TCPServer::~TCPServer() {
+    stop();
+    for (std::thread& worker : workers) {
+        if (worker.joinable()) {
+            worker.join();
+        }
+    }
+}
+
+bool TCPServer::start() {
+    shutdown_requested.store(false, memory_order_relaxed);
+    worker_failed.store(false, memory_order_relaxed);
+    workers.reserve(worker_count);
+
+    try {
+        for (unsigned int worker_id = 0; worker_id < worker_count; ++worker_id) {
+            workers.emplace_back(&TCPServer::worker_loop, this, worker_id);
+        }
+    } catch (const std::exception& exception) {
+        cerr << "Unable to start worker threads: " << exception.what() << '\n';
+        worker_failed.store(true, memory_order_relaxed);
+        stop();
+    }
+
+    for (std::thread& worker : workers) {
+        if (worker.joinable()) {
+            worker.join();
+        }
+    }
+
+    return !worker_failed.load(memory_order_relaxed);
+}
+
+void TCPServer::worker_loop(unsigned int worker_id) {
+    const int listener_fd = create_reuseport_listener(port, backlog);
+    if (listener_fd == -1) {
+        worker_failed.store(true, memory_order_relaxed);
+        shutdown_requested.store(true, memory_order_relaxed);
+        return;
+    }
+
     EpollLoop loop;
-    if (!loop.add_fd(server_fd, EPOLLIN)) {
-        return false;
+    ConnectionManager connections;
+    if (!loop.add_fd(listener_fd, EPOLLIN)) {
+        close(listener_fd);
+        worker_failed.store(true, memory_order_relaxed);
+        shutdown_requested.store(true, memory_order_relaxed);
+        return;
     }
 
-    // Level-triggered epoll: EPOLLIN stays ready until the socket is drained.
-    return loop.run([this, &loop](int fd, unsigned int events) {
-        handle_event(loop, fd, events);
+    Logger::info("Worker " + to_string(worker_id) + " listening on port " +
+                 to_string(port) + " with backlog " + to_string(backlog));
+    const bool loop_completed = loop.run([this, &loop, &connections, listener_fd](int fd,
+                                                                                   unsigned int events) {
+        handle_event(loop, connections, listener_fd, fd, events);
     });
+    if (!loop_completed && !shutdown_requested.load(memory_order_relaxed)) {
+        worker_failed.store(true, memory_order_relaxed);
+        shutdown_requested.store(true, memory_order_relaxed);
+    }
+    close(listener_fd);
 }
 
-// Handle one epoll event by choosing accept, read, or close logic.
-void TCPServer::handle_event(EpollLoop& loop, int fd, unsigned int events) {
-    if (fd == server_fd) {
+void TCPServer::handle_event(EpollLoop& loop, ConnectionManager& connections,
+                             int listener_fd, int fd, unsigned int events) {
+    if (fd == listener_fd) {
         if (events & (EPOLLERR | EPOLLHUP)) {
-            Logger::info("Listening socket failed; stopping server");
-            stop();
-            shutdown_requested = true;
+            worker_failed.store(true, memory_order_relaxed);
+            shutdown_requested.store(true, memory_order_relaxed);
             return;
         }
-
         if (events & EPOLLIN) {
-            accept_clients(loop);
+            accept_clients(loop, connections, listener_fd);
         }
         return;
     }
 
-    // Read first: a peer can send final bytes before it half-closes its side.
-    // handle_client drains the socket and closes it if read() reaches EOF.
-    if (events & EPOLLIN) {
-        handle_client(loop, fd);
+    if (events & (EPOLLERR | EPOLLHUP)) {
+        // A hard error means a response can no longer be delivered.
+        close_client(loop, connections, fd);
         return;
     }
 
-    if (events & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) {
-        close_client(loop, fd);
+    if (events & EPOLLIN) {
+        handle_client(loop, connections, fd);
+        if (connections.get(fd) == nullptr) {
+            return;
+        }
+    }
+
+    Connection* connection = connections.get(fd);
+    if (connection != nullptr && (events & EPOLLRDHUP)) {
+        // The peer stopped writing. We may still write its queued echo back.
+        connection->peer_closed = true;
+    }
+
+    if (events & EPOLLOUT) {
+        flush_client(loop, connections, fd);
+        if (connections.get(fd) == nullptr) {
+            return;
+        }
+    }
+
+    connection = connections.get(fd);
+    if (connection != nullptr && connection->peer_closed && connection->pending_bytes() == 0) {
+        close_client(loop, connections, fd);
     }
 }
 
-// Accept every connection currently waiting in the kernel's listen queue.
-void TCPServer::accept_clients(EpollLoop& loop) {
+void TCPServer::accept_clients(EpollLoop& loop, ConnectionManager& connections,
+                               int listener_fd) {
     while (true) {
         sockaddr_in client_addr{};
         socklen_t client_addr_len = sizeof(client_addr);
-        const int client_fd = accept(server_fd, (struct sockaddr*)(&client_addr), &client_addr_len);
+        const int client_fd = accept(listener_fd, reinterpret_cast<sockaddr*>(&client_addr),
+                                     &client_addr_len);
 
         if (client_fd == -1) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
@@ -158,7 +213,6 @@ void TCPServer::accept_clients(EpollLoop& loop) {
             return;
         }
 
-        // Each client must also be nonblocking before it enters epoll.
         if (!set_nonblocking(client_fd) ||
             !loop.add_fd(client_fd, EPOLLIN | EPOLLRDHUP)) {
             close(client_fd);
@@ -166,59 +220,107 @@ void TCPServer::accept_clients(EpollLoop& loop) {
         }
 
         connections.add(client_fd);
-        Logger::info("Client connected: fd =" + to_string(client_fd));
     }
 }
 
-// Read and echo all data currently available on one client socket.
-void TCPServer::handle_client(EpollLoop& loop, int client_fd) {
+void TCPServer::handle_client(EpollLoop& loop, ConnectionManager& connections, int client_fd) {
+    Connection* connection = connections.get(client_fd);
+    if (connection == nullptr) {
+        return;
+    }
+
     char buffer[1024];
     while (true) {
         const ssize_t bytes_read = read(client_fd, buffer, sizeof(buffer));
         if (bytes_read == 0) {
-            close_client(loop, client_fd);
-            return;
+            connection->peer_closed = true;
+            break;
         }
         if (bytes_read == -1) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                return;
+                break;
             }
             if (errno == EINTR) {
                 continue;
             }
-            perror("read");
-            close_client(loop, client_fd);
+            close_client(loop, connections, client_fd);
             return;
         }
 
-        // Keep the existing simple echo behavior for each available chunk.
-        ssize_t bytes_sent = 0;
-        while (bytes_sent < bytes_read) {
-            const ssize_t result = send(client_fd, buffer + bytes_sent,
-                                        bytes_read - bytes_sent, MSG_NOSIGNAL);
-            if (result <= 0) {
-                close_client(loop, client_fd);
-                return;
-            }
-            bytes_sent += result;
+        // Release consumed prefix space occasionally before appending more.
+        if (connection->outbound_offset > 64 * 1024 &&
+            connection->outbound_offset * 2 >= connection->outbound.size()) {
+            connection->outbound.erase(0, connection->outbound_offset);
+            connection->outbound_offset = 0;
         }
+
+        if (connection->pending_bytes() + static_cast<size_t>(bytes_read) > max_outbound_bytes) {
+            // Bounded buffering prevents one slow receiver exhausting memory.
+            close_client(loop, connections, client_fd);
+            return;
+        }
+        connection->outbound.append(buffer, static_cast<size_t>(bytes_read));
     }
+
+    flush_client(loop, connections, client_fd);
 }
 
-// Unregister a client socket and release its descriptor.
-void TCPServer::close_client(EpollLoop& loop, int client_fd) {
+bool TCPServer::flush_client(EpollLoop& loop, ConnectionManager& connections, int client_fd) {
+    Connection* connection = connections.get(client_fd);
+    if (connection == nullptr) {
+        return false;
+    }
+
+    while (connection->pending_bytes() != 0) {
+        const ssize_t bytes_sent = send(client_fd,
+                                        connection->outbound.data() + connection->outbound_offset,
+                                        connection->pending_bytes(), MSG_NOSIGNAL);
+        if (bytes_sent > 0) {
+            connection->outbound_offset += static_cast<size_t>(bytes_sent);
+            continue;
+        }
+        if (bytes_sent == -1 && (errno == EINTR)) {
+            continue;
+        }
+        if (bytes_sent == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            if (loop.modify_fd(client_fd, EPOLLIN | EPOLLOUT | EPOLLRDHUP)) {
+                return true;
+            }
+            close_client(loop, connections, client_fd);
+            return false;
+        }
+
+        close_client(loop, connections, client_fd);
+        return false;
+    }
+
+    // The entire queue was sent. Release unusually large allocations so a
+    // formerly slow client does not keep 1 MiB reserved forever.
+    if (connection->outbound.capacity() > 64 * 1024) {
+        string().swap(connection->outbound);
+    } else {
+        connection->outbound.clear();
+    }
+    connection->outbound_offset = 0;
+
+    if (connection->peer_closed) {
+        close_client(loop, connections, client_fd);
+        return false;
+    }
+
+    if (loop.modify_fd(client_fd, EPOLLIN | EPOLLRDHUP)) {
+        return true;
+    }
+    close_client(loop, connections, client_fd);
+    return false;
+}
+
+void TCPServer::close_client(EpollLoop& loop, ConnectionManager& connections, int client_fd) {
     loop.remove_fd(client_fd);
     connections.remove(client_fd);
     close(client_fd);
 }
 
-// Close the listening socket during normal shutdown or cleanup.
 void TCPServer::stop() {
-    if (server_fd != -1) {
-        // Closing the listening descriptor also causes future socket use to
-        // stop and makes the descriptor available for reuse by the OS.
-        close(server_fd);
-        server_fd = -1;
-    }
+    shutdown_requested.store(true, memory_order_relaxed);
 }
-
