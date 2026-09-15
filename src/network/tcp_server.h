@@ -58,6 +58,10 @@ public:
     int get_backlog() const { return backlog; }
     unsigned int get_worker_count() const { return worker_count; }
 
+    size_t active_connection_count() const {
+        return active_connections.load(memory_order_relaxed);
+    }
+
     void add_route(string method, string path, Router::Handler handler) {
         router.add_route(std::move(method), std::move(path), std::move(handler));
     }
@@ -89,6 +93,7 @@ private:
     int backlog;
     unsigned int worker_count;
     atomic<bool> worker_failed{false};
+    atomic<size_t> active_connections{0};
     vector<thread> workers;
     Router router;
 };

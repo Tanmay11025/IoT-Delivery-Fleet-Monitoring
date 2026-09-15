@@ -1,5 +1,22 @@
 # Protocol
 
+## Protocol Split
+
+Producers speak HTTP to this gateway and are parsed by its HTTP parser.
+Consumers planned for Week 9 will speak a separate binary TCP protocol. They
+will not speak HTTP. Keeping these protocols separate lets the producer-facing
+API evolve independently from the efficient consumer-facing stream format.
+
+## Observability Endpoints
+
+- `GET /health` returns `{"status":"ok"}` as JSON.
+- `GET /connections` returns the current process-wide active connection count
+  as JSON, for example `{"connections":3}`.
+
+The connection count is maintained with an atomic counter because each worker
+owns a separate connection map. The endpoint reports the aggregate count
+without reading another worker's map.
+
 ## Telemetry Event
 
 Telemetry published by a delivery vehicle or connected device uses this shape:

@@ -260,7 +260,7 @@ Keeping serialization in `HttpResponse` separates HTTP formatting from socket
 writing. Handlers can create a response without knowing anything about epoll or
 partial sends.
 
-### 4.4 Routing
+### 4.4 Routing and observability endpoints
 
 `Router` maps an exact `(method, path)` pair to:
 
@@ -275,7 +275,18 @@ Exact matching was chosen for the first version because it is predictable and
 small. Prefix routes, parameters, middleware, authentication, and method
 fallbacks can be added later without changing the parser or socket layer.
 
-The executable currently registers `GET /health` as a basic end-to-end check.
+The executable currently registers these endpoints:
+
+- `GET /health` returns `{"status":"ok"}` as a JSON liveness response.
+- `GET /connections` returns the process-wide number of active connections as
+    JSON, for example `{"connections":3}`.
+
+Each worker still owns its own `ConnectionManager`, so the connection count is
+maintained separately as an atomic counter on `TCPServer`. The counter is
+incremented after a client is accepted and decremented when that client is
+removed. This provides one safe aggregate value without reading another
+worker's map or adding locks to the normal connection path.
+
 The telemetry contract reserves `POST /publish` for telemetry JSON, but a
 publish handler and JSON validation/storage are application-level work still to
 be added.
@@ -303,6 +314,11 @@ rules, store or forward the event, and produce the application response.
 
 No additional telemetry endpoint is needed. `POST /publish` is the intended
 application contract.
+
+The protocol boundary is intentional: producers speak HTTP to this parser,
+while Week 9 consumers will use a separate binary TCP protocol. Consumers will
+not speak HTTP. Keeping those protocols separate allows the producer-facing API
+and consumer-facing stream format to evolve independently.
 
 ## 6. Why This Overall Approach Was Chosen
 
@@ -348,6 +364,8 @@ Implemented today:
 - Incremental HTTP request parsing.
 - HTTP response serialization.
 - Exact method/path routing.
+- JSON `GET /health` and aggregate `GET /connections` endpoints.
+- Atomic process-wide active-connection accounting across workers.
 - Parser unit tests and live health/404 checks.
 - Telemetry event documentation.
 

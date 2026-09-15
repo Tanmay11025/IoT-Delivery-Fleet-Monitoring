@@ -220,6 +220,7 @@ void TCPServer::accept_clients(EpollLoop& loop, ConnectionManager& connections,
         }
 
         connections.add(client_fd);
+        active_connections.fetch_add(1, memory_order_relaxed);
     }
 }
 
@@ -336,7 +337,10 @@ bool TCPServer::flush_client(EpollLoop& loop, ConnectionManager& connections, in
 
 void TCPServer::close_client(EpollLoop& loop, ConnectionManager& connections, int client_fd) {
     loop.remove_fd(client_fd);
-    connections.remove(client_fd);
+    if (connections.get(client_fd) != nullptr) {
+        connections.remove(client_fd);
+        active_connections.fetch_sub(1, memory_order_relaxed);
+    }
     close(client_fd);
 }
 
