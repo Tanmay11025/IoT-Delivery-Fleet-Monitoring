@@ -1,6 +1,3 @@
-	positions and periodic status updates.
-	2D position grid with moving/idle/offline colors.
-	flow.
 ## IoT Delivery Fleet Monitoring
 
 IoT Delivery Fleet Monitoring aims to provide a live tracking and telemetry
