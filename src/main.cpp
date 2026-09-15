@@ -39,6 +39,9 @@ int main(int argc, char* argv[]) {
 
     // The server object owns the socket and cleans it up automatically
     TCPServer server(port, backlog, static_cast<unsigned int>(workers));
+    server.add_route("GET", "/health", [](const HttpRequest&) {
+        return HttpResponse{200, "OK", {}, "OK\n"};
+    });
 
     // start() returns false for operating-system setup failures
     if (!server.start()) {

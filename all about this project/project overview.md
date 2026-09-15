@@ -283,29 +283,221 @@ The port is converted with `htons()` because network protocols use a standard by
 
 ## 12. Deployment and Docker-based testing preparation
 
-`epoll` reports events using flags such as `EPOLLIN` for readable data and `EPOLLRDHUP` when a peer closes its writing side. These flags let the server decide what action is needed for each descriptor.
+`epoll` reports events using flags such as `EPOLLIN` for readable data and
+`EPOLLRDHUP` when a peer closes its writing side. These flags let the server
+decide what action is needed for each descriptor.
 
 The operating system limits how many file descriptors a process may have open.
 A production deployment must configure `RLIMIT_NOFILE` or the container
-`nofile` limit. The load-generator host also needs enough ephemeral ports and
-socket memory. `net.core.somaxconn` and the TCP SYN backlog cap the effective
-listen backlog.
+`nofile` limit. The load-generator container also needs enough ephemeral ports,
+file descriptors, and socket memory. `net.core.somaxconn` and the TCP SYN
+backlog cap the effective listen backlog.
 
-`scripts/tune_limits.sh` documents host and container settings to review before
-Docker-based testing. Source it when its `ulimit` change should apply to the
-current shell. Docker tests should ramp connections gradually, then sustain
-each level long enough to observe connection leaks, queue saturation, and
-backpressure.
+The testing described below is a Docker Compose connection-ramp test. It tests
+the current TCP echo behavior under many simultaneous connections. It is not a
+telemetry-format, HTTP, authentication, or end-to-end fleet-monitoring test.
 
-### Docker connection-ramp results
+### 12.1 Docker test topology
 
-The Docker Compose setup starts the gateway and a separate Python TCP load
-generator in separate containers. The generator opens the requested number of
-connections, sends a known TCP payload to each, checks that the same payload is
-echoed back, and keeps successful connections open for the requested duration.
-The gateway container is intentionally stopped when the generator finishes by
-the Compose `--abort-on-container-exit` option. Its resulting exit code `137`
-therefore describes test teardown, not a failure during the ramp.
+The Compose file defines two containers:
+
+```text
+                         Docker Compose network
+
+  loadtest container                         gateway container
+  python:3.12-alpine                         Ubuntu 24.04 image
+  tcp_load_generator.py  ── TCP ──────────>  message_gateway:8080
+       many clients       <── echo ─────────
+```
+
+The `gateway` service is built from `docker/Dockerfile`. The Dockerfile starts
+from Ubuntu 24.04, installs `build-essential` and CMake, copies the repository
+into `/app`, configures the CMake project, and compiles the
+`message_gateway` executable. The service then starts:
+
+```text
+./build/message_gateway 8080 65535 0
+```
+
+This means that the gateway listens on port `8080`, uses a listen backlog of
+`65535`, and uses the default worker behavior. With worker count `0`, the
+server creates one worker per detected hardware thread, with a minimum of one.
+The gateway container has a `nofile` soft and hard limit of `200000`, giving it
+enough descriptor capacity for the listening sockets, epoll descriptors, and a
+large number of client sockets. Port `8080` is published to the host for
+optional inspection, although the load generator reaches the gateway through
+the Compose service name `gateway` on the internal Docker network.
+
+The `loadtest` service uses the small `python:3.12-alpine` image. It mounts
+`scripts/tcp_load_generator.py` read-only as `/load_test.py` and runs it with
+Python. It also receives these environment variables:
+
+```text
+CONNECTIONS    number of client sockets to create
+DURATION       number of seconds to keep successful clients open
+LOADTEST_HOST  gateway
+LOADTEST_PORT  8080
+```
+
+The load-generator container also has a `nofile` soft and hard limit of
+`200000`. Its network namespace is configured with:
+
+```yaml
+net.ipv4.ip_local_port_range: "1024 65535"
+```
+
+This expands the range of local ephemeral source ports available to the
+generator. A single source IP and destination pair cannot reuse the same local
+source port for multiple simultaneous TCP connections, so this setting is
+important when one container creates tens of thousands of clients.
+
+The repository's Compose-based test uses the Python generator shown above. The
+commands documented here do not invoke tcpkali2; a tcpkali2 run would be a
+different load-generator implementation and would need its own image, command,
+and result-reporting configuration.
+
+### 12.2 What the load generator does
+
+The test generator is deliberately dependency-free and validates the gateway's
+actual TCP echo path rather than only checking whether a port is open. For each
+run, it performs the following sequence.
+
+1. It reads `CONNECTIONS`, `DURATION`, and `LOADTEST_PORT` as positive integer
+   values. The host defaults to `gateway` if `LOADTEST_HOST` is not supplied.
+2. It waits for Docker DNS and the gateway listener to become available. It
+   repeatedly attempts a short TCP connection for up to ten seconds. This
+   avoids treating normal container startup time as a load-test failure.
+3. It creates the requested number of IPv4 TCP client sockets sequentially.
+   Each client connects to `gateway:8080` and sends the known payload:
+
+   ```text
+   telemetry-gateway-load-check\n
+   ```
+
+4. After sending, each socket is changed to non-blocking mode and retained in
+   memory. The generator records connection or send errors as failures but
+   continues creating the remaining clients.
+5. It registers all successfully opened sockets with Python's selector API.
+   The selector waits until individual sockets have data available, allowing
+   one generator process to verify many sockets without one blocking thread per
+   connection.
+6. It reads from each ready socket until the complete payload has been
+   received. The response must match the payload byte-for-byte. A closed
+   socket, a mismatched response, or a socket that does not complete within
+   thirty seconds counts as a failure.
+7. If echo verification succeeds, it keeps the verified sockets open for the
+   requested `DURATION`. This is the concurrent-connection portion of the
+   test: the gateway must maintain all those established connections while the
+   generator waits.
+8. During the hold period, unexpected data or a peer close is counted as a
+   failure. At the end, the generator closes its client sockets and prints a
+   summary containing the requested connections, successful connections,
+   failures, and elapsed time. It exits with status `0` only when there are no
+   reported failures.
+
+This sequence checks more than the TCP handshake. It checks connection
+creation, data arrival, echo response, non-blocking event handling, connection
+retention, and cleanup from the client side.
+
+### 12.3 Command used to verify the source-port range
+
+Before the main run, the following command was used:
+
+```bash
+docker compose -f docker/docker-compose.loadtest.yml run --rm --no-deps loadtest \
+  cat /proc/sys/net/ipv4/ip_local_port_range
+```
+
+The command creates a temporary `loadtest` container, does not start the
+`gateway` dependency because of `--no-deps`, runs `cat` instead of the normal
+Python command, prints the kernel setting from inside that container, and
+removes the temporary container after completion because of `--rm`.
+
+The expected output is:
+
+```text
+1024 65535
+```
+
+Checking the value inside the container matters because network namespaces can
+have settings different from the host. It confirms that the generator has a
+large enough local source-port range for the 50,000-connection run.
+
+### 12.4 Command used to run the connection test
+
+The main test command was run from the repository root:
+
+```bash
+CONNECTIONS=50000 DURATION=120 ./scripts/run_load_test.sh
+```
+
+The wrapper script executes:
+
+```bash
+docker compose -f docker/docker-compose.loadtest.yml up \
+  --build \
+  --abort-on-container-exit \
+  --exit-code-from loadtest \
+  --remove-orphans
+```
+
+The options have these effects:
+
+- `-f docker/docker-compose.loadtest.yml` selects the load-test Compose file.
+- `up` creates the gateway and loadtest services and starts them together.
+- `--build` rebuilds the gateway image when required, so the test uses the
+  current source and does not depend on an old image.
+- `--abort-on-container-exit` stops the other service when one service exits.
+  Therefore, once the load generator finishes, Compose intentionally stops the
+  gateway container.
+- `--exit-code-from loadtest` makes the overall Compose command report the
+  load-generator status. A zero status means the generator reported no
+  failures; a non-zero status means the generator found a load-test failure.
+- `--remove-orphans` removes containers from the same Compose project that are
+  no longer defined by the current file.
+
+For this run, `CONNECTIONS=50000` overrides the Compose default of `1000`, so
+the generator attempts 50,000 simultaneous clients. `DURATION=120` overrides
+the default hold time of 30 seconds, so verified clients remain connected for
+two minutes. The elapsed time can be greater than 120 seconds because it also
+includes container startup, connection creation, echo verification, and
+shutdown.
+
+### 12.5 What happens inside the gateway during the test
+
+When the gateway container starts, every worker creates its own IPv4 listening
+socket on port `8080`. The sockets use `SO_REUSEPORT`, so Linux distributes new
+connections across the workers. Each worker owns its listener, epoll instance,
+and connection manager.
+
+As the load generator opens clients:
+
+1. A worker's listening socket becomes readable in epoll.
+2. The worker calls `accept()` repeatedly until no more pending connections are
+   immediately available.
+3. Each accepted client socket is made non-blocking and registered with epoll.
+4. When the generator sends the known payload, epoll reports the client socket
+   as readable.
+5. The worker reads the available bytes, appends them to that connection's
+   outbound buffer, and sends the bytes back to the same client.
+6. If the kernel send buffer temporarily cannot accept all output,
+   `EPOLLOUT` is enabled and the remaining bytes stay in the per-connection
+   outbound buffer until the socket becomes writable.
+7. While the generator holds the connections open, the worker event loops keep
+   the sockets registered without busy-polling inactive clients.
+8. When the generator closes the sockets after the hold period, the gateway
+   observes the peer close, removes the descriptors from epoll, releases the
+   connection state, and closes the client sockets.
+
+The test therefore exercises the same accept, epoll, read, echo, buffering,
+partial-write, and cleanup paths used by ordinary clients. It does not exercise
+telemetry parsing because the current server echoes arbitrary bytes and does
+not yet parse the payload as a telemetry message.
+
+### 12.6 Connection-ramp results and interpretation
+
+Testing was performed as a gradual connection ramp before the final 50,000
+connection run. The recorded results were:
 
 | Target connections | Requested hold time | Result | Elapsed time |
 | ---: | ---: | --- | ---: |
@@ -316,103 +508,65 @@ therefore describes test teardown, not a failure during the ramp.
 | 50,000, first attempt | 120 seconds | 28,230 successful, 21,770 failures | 39.24 seconds |
 | 50,000, after generator-port update | 120 seconds | 50,000 successful, 0 failures | 153.99 seconds |
 
-### Why the initial setup stopped at 25,000 validated connections
+The final successful result means that 50,000 client connections were created,
+their echo payloads were verified, and the successful connections remained
+open for the requested two-minute hold period without generator-reported
+failures. The 153.99-second total includes work before and after the hold
+period, so it is not a claim that connection setup and verification took only
+33.99 seconds in isolation.
 
-The initial Docker setup successfully proved the server at 25,000 concurrent
-connections. Its first 50,000-connection attempt did **not** complete: it
-stopped near 28,230 successful connections. That number closely matches the
-usual Linux default ephemeral-port range of `32768` through `60999` (28,232
-ports).
+The first 50,000-connection attempt stopped at approximately 28,230 successful
+clients. This closely matched the usual Linux default ephemeral-port range of
+`32768` through `60999`, which provides about 28,232 ports. The limiting
+resource was the source-port pool of the single load-generator container, not
+the gateway's advertised connection capacity. Each simultaneous connection
+from that generator to `gateway:8080` needs a distinct local source port.
 
-This was a **load-generator limit**, not evidence that the gateway stopped
-accepting connections. Each TCP connection from one generator to
-`gateway:8080` needs a unique client source port. The generator exhausted its
-default source-port pool before it could create all 50,000 connections.
+After setting the generator container's range to `1024 65535`, the available
+source-port pool was large enough for the requested 50,000 clients and the
+test completed successfully. The gateway and load generator were also given
+large file-descriptor limits so that descriptor exhaustion would not occur
+before the intended connection-capacity test.
 
-### Ways to test 50,000 connections
+### 12.7 Teardown and exit code interpretation
 
-There are three practical ways to give the test enough client source ports:
+The load generator is the service whose exit status represents the test result.
+When it finishes its two-minute hold and closes its clients, it exits. Because
+the Compose command uses `--abort-on-container-exit`, Compose then stops the
+gateway container even though the gateway itself has not failed.
 
-1. **Expand the ephemeral-port range in one generator container.** Add the
-   Compose setting `net.ipv4.ip_local_port_range: "1024 65535"`. This provides
-   roughly 64,000 usable source ports in the generator's own network namespace.
-2. **Use two generator containers.** Configure each generator for 25,000
-   connections. Containers have separate network namespaces, so each one has
-   an independent ephemeral-port pool. Together they create 50,000 clients.
-   The test runner must wait for both generators before stopping the gateway.
-3. **Use multiple load-generator hosts.** This is appropriate beyond the
-   capacity of one Docker host, but it requires more machines, network
-   coordination, and result aggregation.
+As a result, the gateway may appear with exit code `137` during this test. That
+code is an expected consequence of Compose stopping the gateway container as
+part of test teardown; it is not evidence that the gateway failed during the
+connection ramp. The meaningful result is the load generator's summary and the
+exit code selected by `--exit-code-from loadtest`.
 
-### Why this project chose the first approach
+### 12.8 What this test proves and does not prove
 
-This project chose the first approach: expanding the ephemeral-port range in
-the existing single load-generator container. It was the smallest change, kept
-the test command and result reporting simple, and avoided coordinating two
-generator containers. The current Compose configuration contains:
+The Docker test provides evidence that the current gateway can:
 
-```yaml
-sysctls:
-  net.ipv4.ip_local_port_range: "1024 65535"
-```
+- Build and start reproducibly inside a Linux container.
+- Accept a large number of simultaneous IPv4 TCP connections.
+- Distribute accepted connections across reuse-port workers.
+- Receive and echo data through the non-blocking epoll path.
+- Maintain verified connections for a sustained hold period.
+- Handle client cleanup after the load generator closes connections.
+- Operate with explicitly configured descriptor and source-port limits.
 
-After that change, the 50,000-connection test completed with 50,000 successful
-connections and zero generator-reported failures. The total elapsed time was
-153.99 seconds; this includes connection setup and echo verification in
-addition to the requested 120-second hold time.
+The test does not prove:
 
-### Commands to run the Docker tests
+- Correct telemetry parsing or validation.
+- Authentication, authorization, rate limiting, or DDoS protection.
+- Durable buffering or downstream broadcasting.
+- Performance under realistic telemetry message rates.
+- Slow-reader behavior or deliberate outbound queue saturation.
+- Multi-host load generation or production deployment behavior.
+- Failure recovery after a process crash or host failure.
 
-Run all commands from the repository root. First clean up any previous test
-containers and confirm Docker accepts the Compose configuration:
-
-```bash
-docker compose -f docker/docker-compose.loadtest.yml down --remove-orphans
-docker compose -f docker/docker-compose.loadtest.yml config
-```
-
-Before large tests, apply the shell file-descriptor limit and verify it:
-
-```bash
-source scripts/tune_limits.sh
-ulimit -n
-```
-
-Verify that the load-generator container has the expanded source-port range:
-
-```bash
-docker compose -f docker/docker-compose.loadtest.yml run --rm --no-deps loadtest \
-  cat /proc/sys/net/ipv4/ip_local_port_range
-```
-
-The expected output is `1024 65535`. In a separate terminal, observe resource
-use throughout a run:
-
-```bash
-docker stats
-```
-
-Run a connection ramp one level at a time. The wrapper builds the gateway image
-when needed, starts the gateway and generator containers, and stops the stack
-after the generator exits:
-
-```bash
-CONNECTIONS=100 DURATION=15 ./scripts/run_load_test.sh
-CONNECTIONS=1000 DURATION=30 ./scripts/run_load_test.sh
-CONNECTIONS=10000 DURATION=60 ./scripts/run_load_test.sh
-CONNECTIONS=25000 DURATION=90 ./scripts/run_load_test.sh
-CONNECTIONS=50000 DURATION=120 ./scripts/run_load_test.sh
-```
-
-For a successful run, the generator prints `successful=<target>` and
-`failures=0`. The gateway's exit code `137` appears because the Compose wrapper
-uses `--abort-on-container-exit` to intentionally stop the gateway after the
-load generator has finished; it is expected teardown behavior in this test.
-
-The gateway has now been validated by this Docker test at 50,000 concurrent
-TCP connections. This validates the current echo-server behavior; telemetry
-parsing, downstream delivery, security controls, and production observability
-remain future work.
+The current echo behavior is a connectivity and concurrency test. It will
+eventually be supplemented or replaced by tests that send real telemetry
+messages and exercise the processing, buffering, and downstream delivery
+pipeline.
 
 ## 13. Keeping this document updated
 

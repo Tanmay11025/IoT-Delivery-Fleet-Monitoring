@@ -82,12 +82,12 @@ TCPServer::TCPServer(int port, int backlog, unsigned int worker_count)
     : port(port),
       backlog(backlog),
       worker_count(worker_count == 0
-                       ? std::max(1u, std::thread::hardware_concurrency())
+                       ? max(1u, thread::hardware_concurrency())
                        : worker_count) {}
 
 TCPServer::~TCPServer() {
     stop();
-    for (std::thread& worker : workers) {
+    for (thread& worker : workers) {
         if (worker.joinable()) {
             worker.join();
         }
@@ -103,13 +103,13 @@ bool TCPServer::start() {
         for (unsigned int worker_id = 0; worker_id < worker_count; ++worker_id) {
             workers.emplace_back(&TCPServer::worker_loop, this, worker_id);
         }
-    } catch (const std::exception& exception) {
+    } catch (const exception& exception) {
         cerr << "Unable to start worker threads: " << exception.what() << '\n';
         worker_failed.store(true, memory_order_relaxed);
         stop();
     }
 
-    for (std::thread& worker : workers) {
+    for (thread& worker : workers) {
         if (worker.joinable()) {
             worker.join();
         }
@@ -247,19 +247,38 @@ void TCPServer::handle_client(EpollLoop& loop, ConnectionManager& connections, i
             return;
         }
 
-        // Release consumed prefix space occasionally before appending more.
-        if (connection->outbound_offset > 64 * 1024 &&
-            connection->outbound_offset * 2 >= connection->outbound.size()) {
-            connection->outbound.erase(0, connection->outbound_offset);
-            connection->outbound_offset = 0;
+        connection->inbound.append(buffer, static_cast<size_t>(bytes_read));
+        const ParseStatus status = connection->parser.feed(connection->inbound);
+        connection->inbound.clear();
+
+        if (status == ParseStatus::Error) {
+            const HttpResponse response{400, "Bad Request", {}, "Bad Request"};
+            const string serialized = response.to_string();
+            if (connection->pending_bytes() + serialized.size() > max_outbound_bytes) {
+                close_client(loop, connections, client_fd);
+                return;
+            }
+            connection->outbound.append(serialized);
+            connection->peer_closed = true;
+            break;
         }
 
-        if (connection->pending_bytes() + static_cast<size_t>(bytes_read) > max_outbound_bytes) {
-            // Bounded buffering prevents one slow receiver exhausting memory.
+        if (status == ParseStatus::Complete) {
+            const HttpResponse response = router.route(connection->parser.request());
+            const string serialized = response.to_string();
+            if (connection->pending_bytes() + serialized.size() > max_outbound_bytes) {
+                close_client(loop, connections, client_fd);
+                return;
+            }
+            connection->outbound.append(serialized);
+            connection->peer_closed = true;
+            break;
+        }
+
+        if (connection->parser.error().size() > 0) {
             close_client(loop, connections, client_fd);
             return;
         }
-        connection->outbound.append(buffer, static_cast<size_t>(bytes_read));
     }
 
     flush_client(loop, connections, client_fd);
