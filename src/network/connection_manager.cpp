@@ -2,7 +2,7 @@
 
 // Store a new client connection by its file descriptor.
 void ConnectionManager::add(int fd) {
-    connections[fd] = Connection{fd, {}, false};
+    connections.insert_or_assign(fd, Connection(fd));
 }
 
 // Erase a client connection from the active connection list.

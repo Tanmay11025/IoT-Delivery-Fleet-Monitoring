@@ -39,6 +39,19 @@ int main(int argc, char* argv[]) {
 
     // The server object owns the socket and cleans it up automatically
     TCPServer server(port, backlog, static_cast<unsigned int>(workers));
+    server.add_route("GET", "/health", [](const HttpRequest&) {
+        return HttpResponse{200, "OK", {{"Content-Type", "application/json"}},
+                            "{\"status\":\"ok\"}"};
+    });
+    server.add_route("GET", "/connections", [&server](const HttpRequest&) {
+        return HttpResponse{200, "OK", {{"Content-Type", "application/json"}},
+                            "{\"connections\":" +
+                                to_string(server.active_connection_count()) + "}"};
+    });
+    server.add_route("GET", "/large-response", [](const HttpRequest&) {
+        // This deterministic payload exercises queued output and EPOLLOUT tests.
+        return HttpResponse{200, "OK", {}, string(512 * 1024, 'x')};
+    });
 
     // start() returns false for operating-system setup failures
     if (!server.start()) {

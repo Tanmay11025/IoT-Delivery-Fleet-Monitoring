@@ -17,6 +17,7 @@
 #include <vector>
 #include <algorithm>
 #include "../core/logger.h"
+#include "../http/router.h"
 #include "connection_manager.h"
 #include "epoll_loop.h"
 
@@ -57,6 +58,14 @@ public:
     int get_backlog() const { return backlog; }
     unsigned int get_worker_count() const { return worker_count; }
 
+    size_t active_connection_count() const {
+        return active_connections.load(memory_order_relaxed);
+    }
+
+    void add_route(string method, string path, Router::Handler handler) {
+        router.add_route(std::move(method), std::move(path), std::move(handler));
+    }
+
 private:
     // Run one complete listener, epoll loop, and connection manager.
     void worker_loop(unsigned int worker_id);
@@ -68,7 +77,7 @@ private:
     // Accept every queued connection without blocking the event loop.
     void accept_clients(EpollLoop& loop, ConnectionManager& connections, int listener_fd);
 
-    // Read all available client data and echo it back.
+    // Read all available client data, parse one request, and queue its response.
     void handle_client(EpollLoop& loop, ConnectionManager& connections, int client_fd);
 
     // Send as much buffered data as the socket currently accepts.
@@ -84,5 +93,7 @@ private:
     int backlog;
     unsigned int worker_count;
     atomic<bool> worker_failed{false};
+    atomic<size_t> active_connections{0};
     vector<thread> workers;
+    Router router;
 };
