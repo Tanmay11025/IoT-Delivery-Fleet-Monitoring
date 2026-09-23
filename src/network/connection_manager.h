@@ -9,6 +9,7 @@ using namespace std;
 
 struct Connection {
     int fd;
+    string client_ip;
     HTTPParser parser;
     string inbound;
     string outbound;
@@ -16,7 +17,7 @@ struct Connection {
     size_t outbound_offset = 0;
     bool peer_closed = false;
 
-    explicit Connection(int connection_fd) : fd(connection_fd) {}
+    Connection(int connection_fd, string ip) : fd(connection_fd), client_ip(move(ip)) {}
 
     size_t pending_bytes() const { return outbound.size() - outbound_offset; }
 };
@@ -24,7 +25,7 @@ struct Connection {
 class ConnectionManager {
 public:
     // Add a connected client to the active connection list.
-    void add(int fd);
+    void add(int fd, string client_ip);
 
     // Remove a client after it disconnects.
     void remove(int fd);

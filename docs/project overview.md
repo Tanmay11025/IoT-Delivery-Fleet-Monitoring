@@ -281,7 +281,36 @@ If someone receives data too slowly, the server keeps only a reasonable amount
 for them and disconnects them before they consume all available memory. When a
 client leaves, every related resource is cleaned up.
 
-## 11. Testing and Verification
+## 11. Per-IP Rate Limiting
+
+The gateway uses a token bucket to protect the request path from one
+malfunctioning or spoofed device flooding the ingestion pipe with fake pings.
+Each client IP gets its own bucket with a capacity of 10 requests and a refill
+rate of 5 requests per second.
+
+### Technical view
+
+`TokenBucket::consume()` uses `steady_clock` to calculate elapsed time, refills
+tokens up to capacity, and consumes one token when available. `RateLimiter`
+stores buckets in an `unordered_map<string, TokenBucket>` protected by a mutex
+because multiple `SO_REUSEPORT` workers share the router's limiter. The router
+checks the client IP after parsing and before handler dispatch. An empty bucket
+produces `429 Too Many Requests`, and the handler is not called.
+
+The process accepts `RATE_LIMIT_CAPACITY` and `RATE_LIMIT_REFILL_RATE` startup
+environment variables for controlled test configurations. The Docker HTTP
+integration suite raises the capacity so its unrelated transport cases do not
+consume the production bucket; focused C++ tests verify the default rejection
+policy directly.
+
+### In simple terms
+
+Every device gets a small cup of request tickets. It may spend the tickets in a
+short burst, but new tickets slowly appear over time. If the cup is empty, the
+gateway says “try later” instead of doing the requested work. A noisy device
+does not use up everyone else's tickets.
+
+## 12. Testing and Verification
 
 The repository includes CMake/CTest parser unit tests in
 `tests/http_parser_test.cpp`. They cover fragmented headers and bodies,
@@ -302,6 +331,7 @@ The suite covers:
 - Header normalization, repeated headers, and conflicting lengths.
 - Header and body size-limit rejection.
 - Exact routing and `404 Not Found` responses.
+- Per-IP rate limiting and `429 Too Many Requests` responses.
 - 100 concurrent HTTP clients.
 - Slow-reader delivery of the 512 KiB `/large-response` body.
 
@@ -348,7 +378,7 @@ The small tests check individual rules, the HTTP suite checks the real server
 with realistic broken and slow clients, and the 50,000-client test checks how
 many connections the network foundation can keep alive.
 
-## 12. Implemented, Planned, and Limited
+## 13. Implemented, Planned, and Limited
 
 ### Implemented
 
@@ -364,6 +394,7 @@ many connections the network foundation can keep alive.
 - Parser unit tests and Docker TCP connection-ramp testing.
 - Protocol documentation describing the HTTP/binary-TCP split.
 - Docker raw-socket HTTP integration tests with 10 passing cases.
+- Per-IP token-bucket rate limiting with a mutex-protected shared limiter.
 
 ### Planned next
 
@@ -371,7 +402,7 @@ many connections the network foundation can keep alive.
 - Parse and validate telemetry JSON and field ranges.
 - Persist or forward accepted telemetry.
 - Implement the Week 9 binary consumer protocol.
-- Add authentication, rate limiting, and spam/DDoS protection.
+- Add authentication and broader spam/DDoS protection.
 - Add downstream backpressure and failure-recovery tests.
 - Add production-level metrics and observability.
 
@@ -384,6 +415,8 @@ many connections the network foundation can keep alive.
 - Chunked transfer encoding is rejected.
 - The queue limit is a fixed safe default, not workload-specific tuning.
 - The Docker load test has not yet been converted from raw echo to HTTP.
+- Inactive IP buckets are not yet expired, so the limiter map needs bounded
+  cleanup before hostile high-cardinality traffic is considered production-safe.
 
 ### Interview summary
 
@@ -398,7 +431,7 @@ reliably. Then we taught it how to understand HTTP safely. Next we need to
 teach it what telemetry means, where to store it, and how to stream it to the
 future consumers.
 
-## 13. Keeping This Document Updated
+## 14. Keeping This Document Updated
 
 Update this document when a change affects the architecture, a design decision,
 the implemented feature list, planned work, or current limitations. Each

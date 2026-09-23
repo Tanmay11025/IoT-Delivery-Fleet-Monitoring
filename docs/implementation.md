@@ -298,6 +298,13 @@ transport test surface, not a telemetry feature: the body consists of repeated
 `x` bytes so a raw-socket client can verify the exact `Content-Length` and
 payload while reading slowly.
 
+The router also owns a shared, mutex-protected per-IP token-bucket limiter. Its
+production default policy allows a burst of 10 requests and refills at 5
+requests per second. `RATE_LIMIT_CAPACITY` and `RATE_LIMIT_REFILL_RATE` may
+override these values at process startup for controlled test environments.
+When a bucket is empty, routing returns `429 Too Many Requests` before the
+application handler is called.
+
 ## 4.5 HTTP integration test strategy
 
 The repository includes a separate Docker-based raw-socket integration suite
@@ -426,10 +433,13 @@ Implemented today:
 - HTTP response serialization.
 - Exact method/path routing.
 - JSON `GET /health` and aggregate `GET /connections` endpoints.
+- Per-IP token-bucket rate limiting with `429 Too Many Requests` responses.
 - Atomic process-wide active-connection accounting across workers.
 - Parser unit tests and live health/404 checks.
 - Docker raw-socket HTTP integration tests for complete, fragmented, malformed,
   concurrent, size-limit, routing, connection-close, and slow-reader cases.
+- Focused C++ rate-limiter tests for burst/refill behavior, per-IP isolation,
+  and handler bypass on `429 Too Many Requests`.
 - A deterministic large-response endpoint for testing partial response writes.
 - Telemetry event documentation.
 
@@ -442,5 +452,6 @@ Still to implement:
 - Add keep-alive or pipelining if required.
 - Add chunked transfer encoding if required.
 - Add application-level telemetry and failure tests.
+- Add inactive-IP bucket expiration and a bounded limiter map.
 - Replace the transport-only HTTP integration fixtures with telemetry-aware
     tests once `POST /publish` is implemented.

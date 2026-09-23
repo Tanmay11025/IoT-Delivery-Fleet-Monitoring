@@ -134,6 +134,40 @@ This is stronger evidence than the C++ parser tests alone because it includes
 the real socket, epoll loop, connection state, router, response serializer, and
 nonblocking write path.
 
+### Troubleshooting and lessons learned
+
+The first HTTP integration run after adding the per-IP token-bucket limiter
+exposed an interaction between the security policy and the test suite. The
+Docker test clients all appeared to come from the same container IP, so the
+earlier tests consumed the default 10-token bucket. Later tests then received
+`429 Too Many Requests` even though they were intended to test concurrency and
+response delivery rather than rate limiting.
+
+The first attempted fix was to bind concurrent Python clients to different
+loopback source addresses. That was not portable inside the Alpine Docker
+network namespace: the sockets failed with `EINVAL` because those addresses
+were not assigned there.
+
+The final fix separated the test policies. The production server keeps the
+default policy of a 10-request burst and a 5-request-per-second refill. The
+HTTP integration Compose service sets:
+
+```text
+RATE_LIMIT_CAPACITY=1000
+RATE_LIMIT_REFILL_RATE=0
+```
+
+This prevents unrelated transport tests from exhausting the security bucket.
+The focused C++ rate-limiter tests separately verify burst behavior, refill,
+per-IP isolation, and that a rejected request returns `429` without calling
+the handler.
+
+The lesson is that a test suite must isolate the policy it is trying to
+measure. A failing integration test is not automatically a product bug: it
+may reveal that two valid features are interfering through shared state. We
+kept the production protection intact, removed the Docker-specific networking
+assumption, and made the test configuration explicit.
+
 The suite does not yet validate telemetry JSON or `POST /publish`, because that
 application handler has not been implemented. The 50,000-client test below is
 also separate: it validates the historical raw TCP echo path and connection

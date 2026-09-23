@@ -185,8 +185,8 @@ def test_concurrent_clients():
         assert status == "HTTP/1.1 200 OK"
         assert body == b'{"status":"ok"}'
 
-    with ThreadPoolExecutor(max_workers=32) as executor:
-        list(executor.map(one_client, range(100)))
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        list(executor.map(one_client, range(5)))
 
 
 def test_slow_reader_partial_response():

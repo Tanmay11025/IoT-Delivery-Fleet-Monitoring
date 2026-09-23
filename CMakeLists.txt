@@ -11,6 +11,7 @@ add_executable(message_gateway
 	src/http/http_parser.cpp
 	src/http/http_response.cpp
 	src/http/router.cpp
+	src/security/rate_limiter.cpp
 	src/network/connection_manager.cpp
 	src/network/epoll_loop.cpp
 	src/network/tcp_server.cpp
@@ -29,3 +30,15 @@ add_executable(http_parser_tests
 target_include_directories(http_parser_tests PRIVATE src)
 target_compile_options(http_parser_tests PRIVATE -Wall -Wextra -Wpedantic)
 add_test(NAME http_parser_tests COMMAND http_parser_tests)
+
+add_executable(rate_limiter_tests
+	tests/rate_limiter_test.cpp
+	src/http/http_parser.cpp
+	src/http/http_response.cpp
+	src/http/router.cpp
+	src/security/rate_limiter.cpp
+)
+
+target_include_directories(rate_limiter_tests PRIVATE src)
+target_compile_options(rate_limiter_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME rate_limiter_tests COMMAND rate_limiter_tests)
