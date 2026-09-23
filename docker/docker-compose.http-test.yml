@@ -1,0 +1,21 @@
+services:
+  gateway:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    command: ["./build/message_gateway", "8080", "128", "1"]
+    ulimits:
+      nofile:
+        soft: 200000
+        hard: 200000
+
+  http-test:
+    image: python:3.12-alpine
+    depends_on:
+      - gateway
+    environment:
+      HTTP_TEST_HOST: gateway
+      HTTP_TEST_PORT: 8080
+    volumes:
+      - ../tests/http_integration_test.py:/http_integration_test.py:ro
+    command: ["python", "/http_integration_test.py"]

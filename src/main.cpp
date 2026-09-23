@@ -48,6 +48,10 @@ int main(int argc, char* argv[]) {
                             "{\"connections\":" +
                                 to_string(server.active_connection_count()) + "}"};
     });
+    server.add_route("GET", "/large-response", [](const HttpRequest&) {
+        // This deterministic payload exercises queued output and EPOLLOUT tests.
+        return HttpResponse{200, "OK", {}, string(512 * 1024, 'x')};
+    });
 
     // start() returns false for operating-system setup failures
     if (!server.start()) {

@@ -280,6 +280,8 @@ The executable currently registers these endpoints:
 - `GET /health` returns `{"status":"ok"}` as a JSON liveness response.
 - `GET /connections` returns the process-wide number of active connections as
     JSON, for example `{"connections":3}`.
+- `GET /large-response` returns a deterministic 512 KiB body for integration
+    tests that exercise slow readers, partial writes, and `EPOLLOUT`.
 
 Each worker still owns its own `ConnectionManager`, so the connection count is
 maintained separately as an atomic counter on `TCPServer`. The counter is
@@ -290,6 +292,65 @@ worker's map or adding locks to the normal connection path.
 The telemetry contract reserves `POST /publish` for telemetry JSON, but a
 publish handler and JSON validation/storage are application-level work still to
 be added.
+
+The large-response endpoint is intentionally simple and deterministic. It is a
+transport test surface, not a telemetry feature: the body consists of repeated
+`x` bytes so a raw-socket client can verify the exact `Content-Length` and
+payload while reading slowly.
+
+## 4.5 HTTP integration test strategy
+
+The repository includes a separate Docker-based raw-socket integration suite
+in `tests/http_integration_test.py`. It uses Python's standard-library
+`socket`, not an HTTP client library, so the test controls the exact TCP writes
+and can deliberately send a request one byte at a time.
+
+Run it later with:
+
+```bash
+./scripts/run_http_integration_test.sh
+```
+
+The Compose file starts the compiled gateway in one container and the Python
+test in a separate `python:3.12-alpine` container. The test container exits
+with success only when every case passes. Docker is used here for reproducible
+service startup, clean networking, and a test environment separate from the
+developer's host Python installation.
+
+The suite covers:
+
+- A normal `GET /health` request and response framing.
+- A byte-by-byte `GET /health` request with delays between writes.
+- A fragmented request body with `Content-Length`.
+- Malformed request lines, headers, HTTP versions, and transfer encoding.
+- Header normalization, repeated headers, and conflicting content lengths.
+- Header and body size-limit rejection.
+- Exact method/path routing and 404 responses.
+- Connection closure after one response.
+- 100 concurrent raw-socket HTTP clients.
+- A slow reader consuming a 512 KiB response in small chunks.
+
+The last case uses `GET /large-response`, a deterministic transport-test
+endpoint that returns 512 KiB of `x` bytes. The client limits its receive
+buffer, reads slowly, verifies the exact `Content-Length`, and checks every
+body byte. This gives the server's outbound queue and `EPOLLOUT` path a real
+backpressure scenario. It validates complete delivery, not a particular number
+of individual `send()` calls, because TCP and the kernel are free to combine or
+split writes.
+
+These tests complement the other test layers:
+
+```text
+HTTPParser C++ unit tests       -> parser logic in isolation
+raw-socket HTTP integration     -> real TCP server, parser, router, responses
+slow-reader integration         -> partial writes and EPOLLOUT backpressure
+50,000-client Docker load test  -> connection-scale stability and retention
+```
+
+The suite intentionally does not test telemetry JSON validation yet because
+`POST /publish` has not been implemented. Once that handler exists, the same
+Docker test should add valid and invalid telemetry requests and assert the
+application-level response.
 
 ## 5. Telemetry Contract
 
@@ -367,6 +428,9 @@ Implemented today:
 - JSON `GET /health` and aggregate `GET /connections` endpoints.
 - Atomic process-wide active-connection accounting across workers.
 - Parser unit tests and live health/404 checks.
+- Docker raw-socket HTTP integration tests for complete, fragmented, malformed,
+  concurrent, size-limit, routing, connection-close, and slow-reader cases.
+- A deterministic large-response endpoint for testing partial response writes.
 - Telemetry event documentation.
 
 Still to implement:
@@ -378,3 +442,5 @@ Still to implement:
 - Add keep-alive or pipelining if required.
 - Add chunked transfer encoding if required.
 - Add application-level telemetry and failure tests.
+- Replace the transport-only HTTP integration fixtures with telemetry-aware
+    tests once `POST /publish` is implemented.
