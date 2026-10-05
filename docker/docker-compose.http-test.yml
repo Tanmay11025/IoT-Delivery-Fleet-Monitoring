@@ -4,6 +4,9 @@ services:
       context: ..
       dockerfile: docker/Dockerfile
     command: ["./build/message_gateway", "8080", "128", "1"]
+    environment:
+      RATE_LIMIT_CAPACITY: 1000
+      RATE_LIMIT_REFILL_RATE: 0
     ulimits:
       nofile:
         soft: 200000

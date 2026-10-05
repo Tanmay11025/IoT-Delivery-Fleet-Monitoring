@@ -1,11 +1,19 @@
 #include "router.h"
 
+Router::Router(double rate_limit_capacity, double rate_limit_refill_rate)
+    : rate_limiter(rate_limit_capacity, rate_limit_refill_rate) {}
+
 void Router::add_route(string method, string path, Handler handler) {
     // insert_or_assign makes registering the same method/path replace its handler.
     routes.insert_or_assign(RouteKey{move(method), move(path)}, move(handler));
 }
 
-HttpResponse Router::route(const HttpRequest& request) const {
+HttpResponse Router::route(const HttpRequest& request, const string& client_ip) {
+    // Reject excess requests before invoking application code.
+    if (!rate_limiter.check(client_ip)) {
+        return HttpResponse{429, "Too Many Requests", {}, "Too Many Requests"};
+    }
+
     // Look up the route using the exact method and path from the parsed request.
     const auto route = routes.find(RouteKey{request.method, request.path});
     if (route == routes.end()) {

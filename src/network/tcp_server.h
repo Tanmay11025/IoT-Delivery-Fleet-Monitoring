@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <iostream>
 #include <netinet/in.h>
+#include <arpa/inet.h>
 #include <sys/socket.h>
 #include <unistd.h>
 #include <cstdlib>
@@ -20,6 +21,7 @@
 #include "../http/router.h"
 #include "connection_manager.h"
 #include "epoll_loop.h"
+#include "../monitoring/metrics.h"
 
 using namespace std;
 
@@ -38,7 +40,9 @@ int create_reuseport_listener(int port, int backlog);
 class TCPServer {
 public:
     // Store the configuration used to create and listen on the server socket.
-    TCPServer(int port, int backlog, unsigned int worker_count = 0);
+    TCPServer(int port, int backlog, unsigned int worker_count = 0,
+              double rate_limit_capacity = 10.0,
+              double rate_limit_refill_rate = 5.0);
 
     // Release the server socket when the object leaves scope.
     ~TCPServer();
@@ -59,7 +63,11 @@ public:
     unsigned int get_worker_count() const { return worker_count; }
 
     size_t active_connection_count() const {
-        return active_connections.load(memory_order_relaxed);
+        return metrics.active_connections();
+    }
+
+    string metrics_text() const {
+        return metrics.prometheus_text();
     }
 
     void add_route(string method, string path, Router::Handler handler) {
@@ -93,7 +101,7 @@ private:
     int backlog;
     unsigned int worker_count;
     atomic<bool> worker_failed{false};
-    atomic<size_t> active_connections{0};
+    Metrics metrics;
     vector<thread> workers;
     Router router;
 };

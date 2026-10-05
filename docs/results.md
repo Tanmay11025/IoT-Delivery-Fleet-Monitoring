@@ -3,7 +3,7 @@
 ## 1. Build and Unit-Test Results
 
 The stale CMake cache was removed and the project was configured from the
-current workspace path. The production gateway and HTTP parser test target
+current workspace path. The production gateway and all three C++ test targets
 build successfully with C++17 and the configured compiler warnings.
 
 The one-line command used for the local build and tests was:
@@ -18,10 +18,32 @@ Result:
 100% tests passed, 0 tests failed
 ```
 
+The latest CTest run reported:
+
+```text
+http_parser_tests   Passed
+rate_limiter_tests  Passed
+metrics_tests       Passed
+
+100% tests passed, 0 tests failed out of 3
+```
+
 The parser tests verify fragmented headers, fragmented bodies, body completion
 based on `Content-Length`, requests without bodies, case-insensitive header
 lookup, malformed request rejection, conflicting content lengths, unsupported
 chunked encoding, and header/body size limits.
+
+The rate-limiter tests inject a fake `steady_clock` time point into
+`TokenBucket`, so elapsed time can be advanced directly without sleeping. They
+verify initial burst consumption, rejection when empty, refill after 100 ms at
+10 tokens per second, refill capped at bucket capacity, and no refill with a
+zero refill rate even after advancing by an hour. The same target checks
+per-IP isolation and that a rate-limited router request returns `429` without
+calling its handler.
+
+The metrics unit tests verify the active and accepted connection values,
+request and blocked-request totals, response counts by status class, histogram
+bucket/count/sum values, parse-error count, and the presence of process uptime.
 
 ## 2. HTTP Verification Results
 
@@ -45,7 +67,7 @@ an HTTP request one byte at a time.
 
 ### Tests used
 
-The suite in `tests/http_integration_test.py` contains ten checks:
+The suite in `tests/http_integration_test.py` contains eleven checks:
 
 1. A normal `GET /health` request and response body.
 2. A byte-by-byte `GET /health` request with a small delay between writes.
@@ -57,6 +79,8 @@ The suite in `tests/http_integration_test.py` contains ten checks:
 8. Exact routing for valid and unknown method/path pairs.
 9. One hundred concurrent raw-socket HTTP clients.
 10. A slow reader consuming the 512 KiB `/large-response` body in small chunks.
+11. The `/metrics` endpoint's exposition format, required samples, and scrape
+    counter behavior.
 
 ### How the test was run
 
@@ -105,7 +129,8 @@ PASS test_size_limits
 PASS test_routing
 PASS test_concurrent_clients
 PASS test_slow_reader_partial_response
-PASS all HTTP integration tests (10)
+PASS test_metrics_endpoint
+PASS all HTTP integration tests (11)
 http-test exited with code 0
 ```
 
@@ -129,10 +154,72 @@ traffic. In particular, they show that:
 - Multiple clients can use the server concurrently without response mixing.
 - A slow reader can still receive a complete large response.
 - The response queue and `EPOLLOUT` path preserve the complete response body.
+- `/metrics` returns Prometheus text with the expected metric samples and
+	content type.
+
+### Metrics endpoint verification
+
+The integration suite exercises `/metrics` using the same raw-socket HTTP
+client as the other endpoint tests. It checks the Prometheus content type and
+required samples, including active/accepted connections, request and blocked
+request totals, parser errors, response classes, request-duration histogram,
+and uptime. It also performs repeated scrapes and verifies that the request
+counter advances between them and that the histogram count reflects completed
+requests.
+
+The endpoint was also checked manually while the gateway was running:
+
+```bash
+curl -i http://localhost:8080/metrics
+```
+
+The first scrape showed one accepted connection and one routed request, with
+zero completed response observations. The next scrape showed two accepted
+connections and two requests, plus one completed `2xx` response and one
+duration observation. This confirms the intentional snapshot timing: request
+and active-connection values include the current scrape, while its response
+class and duration are recorded after its metrics body has been generated and
+appear on the following scrape. The active-connection gauge is `1` during a
+scrape because that client connection is still open while the response is
+being prepared.
 
 This is stronger evidence than the C++ parser tests alone because it includes
 the real socket, epoll loop, connection state, router, response serializer, and
 nonblocking write path.
+
+### Troubleshooting and lessons learned
+
+The first HTTP integration run after adding the per-IP token-bucket limiter
+exposed an interaction between the security policy and the test suite. The
+Docker test clients all appeared to come from the same container IP, so the
+earlier tests consumed the default 10-token bucket. Later tests then received
+`429 Too Many Requests` even though they were intended to test concurrency and
+response delivery rather than rate limiting.
+
+The first attempted fix was to bind concurrent Python clients to different
+loopback source addresses. That was not portable inside the Alpine Docker
+network namespace: the sockets failed with `EINVAL` because those addresses
+were not assigned there.
+
+The final fix separated the test policies. The production server keeps the
+default policy of a 10-request burst and a 5-request-per-second refill. The
+HTTP integration Compose service sets:
+
+```text
+RATE_LIMIT_CAPACITY=1000
+RATE_LIMIT_REFILL_RATE=0
+```
+
+This prevents unrelated transport tests from exhausting the security bucket.
+The focused C++ rate-limiter tests separately verify burst behavior, refill,
+per-IP isolation, and that a rejected request returns `429` without calling
+the handler.
+
+The lesson is that a test suite must isolate the policy it is trying to
+measure. A failing integration test is not automatically a product bug: it
+may reveal that two valid features are interfering through shared state. We
+kept the production protection intact, removed the Docker-specific networking
+assumption, and made the test configuration explicit.
 
 The suite does not yet validate telemetry JSON or `POST /publish`, because that
 application handler has not been implemented. The 50,000-client test below is

@@ -2,6 +2,7 @@
 
 #include "../http/http_parser.h"
 #include "http_response.h"
+#include "../security/rate_limiter.h"
 
 #include <functional>
 #include <string>
@@ -15,11 +16,14 @@ class Router {
 public:
     using Handler = function<HttpResponse(const HttpRequest&)>;
 
+    explicit Router(double rate_limit_capacity = 10.0,
+                    double rate_limit_refill_rate = 5.0);
+
     // Register or replace a handler for a method/path pair.
     void add_route(string method, string path, Handler handler);
 
     // Dispatch a request, returning 404 when no route matches.
-    HttpResponse route(const HttpRequest& request) const;
+    HttpResponse route(const HttpRequest& request, const string& client_ip);
 
 private:
     // The method and path together identify one route.
@@ -39,4 +43,5 @@ private:
     };
 
     unordered_map<RouteKey, Handler, RouteKeyHash> routes;
+    RateLimiter rate_limiter;
 };

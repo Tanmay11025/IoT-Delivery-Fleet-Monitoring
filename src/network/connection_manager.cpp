@@ -1,8 +1,8 @@
 #include "connection_manager.h"
 
 // Store a new client connection by its file descriptor.
-void ConnectionManager::add(int fd) {
-    connections.insert_or_assign(fd, Connection(fd));
+void ConnectionManager::add(int fd, string client_ip) {
+    connections.insert_or_assign(fd, Connection(fd, move(client_ip)));
 }
 
 // Erase a client connection from the active connection list.

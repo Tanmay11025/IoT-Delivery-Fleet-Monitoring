@@ -37,8 +37,16 @@ int main(int argc, char* argv[]) {
         return EXIT_FAILURE;
     }
 
-    // The server object owns the socket and cleans it up automatically
-    TCPServer server(port, backlog, static_cast<unsigned int>(workers));
+    // The server object owns the socket and cleans it up automatically.
+    // Tests may override the limiter policy without changing production defaults.
+    const double rate_limit_capacity = getenv("RATE_LIMIT_CAPACITY") == nullptr
+                                           ? 10.0
+                                           : stod(getenv("RATE_LIMIT_CAPACITY"));
+    const double rate_limit_refill_rate = getenv("RATE_LIMIT_REFILL_RATE") == nullptr
+                                              ? 5.0
+                                              : stod(getenv("RATE_LIMIT_REFILL_RATE"));
+    TCPServer server(port, backlog, static_cast<unsigned int>(workers),
+                     rate_limit_capacity, rate_limit_refill_rate);
     server.add_route("GET", "/health", [](const HttpRequest&) {
         return HttpResponse{200, "OK", {{"Content-Type", "application/json"}},
                             "{\"status\":\"ok\"}"};
@@ -47,6 +55,11 @@ int main(int argc, char* argv[]) {
         return HttpResponse{200, "OK", {{"Content-Type", "application/json"}},
                             "{\"connections\":" +
                                 to_string(server.active_connection_count()) + "}"};
+    });
+    server.add_route("GET", "/metrics", [&server](const HttpRequest&) {
+        return HttpResponse{200, "OK",
+                            {{"Content-Type", "text/plain; version=0.0.4; charset=utf-8"}},
+                            server.metrics_text()};
     });
     server.add_route("GET", "/large-response", [](const HttpRequest&) {
         // This deterministic payload exercises queued output and EPOLLOUT tests.

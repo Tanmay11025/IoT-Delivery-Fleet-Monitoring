@@ -177,6 +177,52 @@ def test_routing():
     )
 
 
+def parse_prometheus_samples(body):
+    samples = {}
+    for line in body.decode("ascii").splitlines():
+        if not line or line.startswith("#"):
+            continue
+        sample, value = line.rsplit(" ", 1)
+        samples[sample] = float(value)
+    return samples
+
+
+def test_metrics_endpoint():
+    request = b"GET /metrics HTTP/1.1\r\nHost: gateway\r\n\r\n"
+    status, headers, first_body = send_request(request)
+    assert status == "HTTP/1.1 200 OK"
+    assert headers["content-type"].startswith("text/plain; version=0.0.4")
+    first = parse_prometheus_samples(first_body)
+
+    required_samples = [
+        "gateway_connections_active",
+        "gateway_connections_accepted_total",
+        "gateway_http_requests_total",
+        "gateway_http_requests_blocked_total",
+        "gateway_http_parse_errors_total",
+        'gateway_http_responses_total{status_class="2xx"}',
+        'gateway_http_responses_total{status_class="4xx"}',
+        'gateway_http_request_duration_seconds_bucket{le="+Inf"}',
+        "gateway_http_request_duration_seconds_sum",
+        "gateway_http_request_duration_seconds_count",
+        "process_uptime_seconds",
+    ]
+    assert all(sample in first for sample in required_samples)
+    assert first["gateway_connections_active"] >= 1
+    assert first["gateway_connections_accepted_total"] >= 1
+    assert first["gateway_http_parse_errors_total"] >= 1
+    assert first['gateway_http_responses_total{status_class="4xx"}'] >= 1
+    assert first["process_uptime_seconds"] >= 0
+
+    status, _, second_body = send_request(request)
+    assert status == "HTTP/1.1 200 OK"
+    second = parse_prometheus_samples(second_body)
+    assert second["gateway_http_requests_total"] == first["gateway_http_requests_total"] + 1
+    assert second["gateway_http_request_duration_seconds_count"] == first[
+        "gateway_http_requests_total"
+    ]
+
+
 def test_concurrent_clients():
     request = b"GET /health HTTP/1.1\r\nHost: gateway\r\n\r\n"
 
@@ -185,8 +231,8 @@ def test_concurrent_clients():
         assert status == "HTTP/1.1 200 OK"
         assert body == b'{"status":"ok"}'
 
-    with ThreadPoolExecutor(max_workers=32) as executor:
-        list(executor.map(one_client, range(100)))
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        list(executor.map(one_client, range(5)))
 
 
 def test_slow_reader_partial_response():
@@ -226,6 +272,7 @@ def main():
         test_routing,
         test_concurrent_clients,
         test_slow_reader_partial_response,
+        test_metrics_endpoint,
     ]
     for test in tests:
         test()

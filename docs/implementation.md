@@ -278,10 +278,22 @@ fallbacks can be added later without changing the parser or socket layer.
 The executable currently registers these endpoints:
 
 - `GET /health` returns `{"status":"ok"}` as a JSON liveness response.
-- `GET /connections` returns the process-wide number of active connections as
-    JSON, for example `{"connections":3}`.
-- `GET /large-response` returns a deterministic 512 KiB body for integration
-    tests that exercise slow readers, partial writes, and `EPOLLOUT`.
+- `GET /connections` returns the active connection count as JSON, such as
+  `{"connections":3}`.
+- `GET /metrics` returns Prometheus text for `gateway_connections_active`,
+  `gateway_connections_accepted_total`, `gateway_http_requests_total`,
+  `gateway_http_requests_blocked_total`, `gateway_http_parse_errors_total`,
+  `gateway_http_responses_total` grouped by status class,
+  `gateway_http_request_duration_seconds`, and `process_uptime_seconds`.
+- `GET /large-response` returns a deterministic 512 KiB body for transport
+  tests of slow readers and partial writes.
+
+The metrics collector counts each complete parsed request immediately before
+router dispatch; malformed requests are counted separately. Rate-limited
+requests are included in both request and blocked-request totals. A `/metrics`
+scrape counts as a request and active connection, while its response class and
+duration are recorded after the exposition is generated. The duration metric
+covers router dispatch, not request parsing or socket transmission.
 
 Each worker still owns its own `ConnectionManager`, so the connection count is
 maintained separately as an atomic counter on `TCPServer`. The counter is
@@ -297,6 +309,20 @@ The large-response endpoint is intentionally simple and deterministic. It is a
 transport test surface, not a telemetry feature: the body consists of repeated
 `x` bytes so a raw-socket client can verify the exact `Content-Length` and
 payload while reading slowly.
+
+The router also owns a shared, mutex-protected per-IP token-bucket limiter. Its
+production default policy allows a burst of 10 requests and refills at 5
+requests per second. `RATE_LIMIT_CAPACITY` and `RATE_LIMIT_REFILL_RATE` may
+override these values at process startup for controlled test environments.
+When a bucket is empty, routing returns `429 Too Many Requests` before the
+application handler is called.
+
+`TokenBucket::consume()` measures elapsed time with `steady_clock`, adds tokens
+at the configured refill rate up to the bucket capacity, and deducts one token
+when available. The bucket accepts a clock function that defaults to
+`steady_clock::now()` in production. Unit tests inject a fake clock and advance
+it directly to verify burst allowance, refill, capacity capping, and zero-rate
+behavior without sleeping or opening network connections.
 
 ## 4.5 HTTP integration test strategy
 
@@ -426,10 +452,13 @@ Implemented today:
 - HTTP response serialization.
 - Exact method/path routing.
 - JSON `GET /health` and aggregate `GET /connections` endpoints.
+- Per-IP token-bucket rate limiting with `429 Too Many Requests` responses.
 - Atomic process-wide active-connection accounting across workers.
 - Parser unit tests and live health/404 checks.
 - Docker raw-socket HTTP integration tests for complete, fragmented, malformed,
   concurrent, size-limit, routing, connection-close, and slow-reader cases.
+- Focused C++ rate-limiter tests for burst/refill behavior, per-IP isolation,
+  and handler bypass on `429 Too Many Requests`.
 - A deterministic large-response endpoint for testing partial response writes.
 - Telemetry event documentation.
 
@@ -442,5 +471,6 @@ Still to implement:
 - Add keep-alive or pipelining if required.
 - Add chunked transfer encoding if required.
 - Add application-level telemetry and failure tests.
+- Add inactive-IP bucket expiration and a bounded limiter map.
 - Replace the transport-only HTTP integration fixtures with telemetry-aware
     tests once `POST /publish` is implemented.
