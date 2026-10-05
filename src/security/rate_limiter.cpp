@@ -3,14 +3,15 @@
 #include <algorithm>
 #include <utility>
 
-TokenBucket::TokenBucket(double capacity, double refill_rate)
+TokenBucket::TokenBucket(double capacity, double refill_rate, Clock clock)
     : capacity(capacity),
       tokens(capacity),
       refill_rate(refill_rate),
-      last_refill_time(std::chrono::steady_clock::now()) {}
+      clock(std::move(clock)),
+      last_refill_time(this->clock()) {}
 
 bool TokenBucket::consume() {
-    const auto now = std::chrono::steady_clock::now();
+    const auto now = clock();
     const std::chrono::duration<double> elapsed = now - last_refill_time;
     tokens = std::min(capacity, tokens + elapsed.count() * refill_rate);
     last_refill_time = now;

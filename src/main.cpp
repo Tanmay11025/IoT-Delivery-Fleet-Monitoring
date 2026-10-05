@@ -56,6 +56,11 @@ int main(int argc, char* argv[]) {
                             "{\"connections\":" +
                                 to_string(server.active_connection_count()) + "}"};
     });
+    server.add_route("GET", "/metrics", [&server](const HttpRequest&) {
+        return HttpResponse{200, "OK",
+                            {{"Content-Type", "text/plain; version=0.0.4; charset=utf-8"}},
+                            server.metrics_text()};
+    });
     server.add_route("GET", "/large-response", [](const HttpRequest&) {
         // This deterministic payload exercises queued output and EPOLLOUT tests.
         return HttpResponse{200, "OK", {}, string(512 * 1024, 'x')};

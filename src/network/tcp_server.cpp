@@ -228,7 +228,7 @@ void TCPServer::accept_clients(EpollLoop& loop, ConnectionManager& connections,
         }
 
         connections.add(client_fd, client_ip);
-        active_connections.fetch_add(1, memory_order_relaxed);
+        metrics.connection_opened();
     }
 }
 
@@ -261,6 +261,7 @@ void TCPServer::handle_client(EpollLoop& loop, ConnectionManager& connections, i
         connection->inbound.clear();
 
         if (status == ParseStatus::Error) {
+            metrics.parse_error();
             const HttpResponse response{400, "Bad Request", {}, "Bad Request"};
             const string serialized = response.to_string();
             if (connection->pending_bytes() + serialized.size() > max_outbound_bytes) {
@@ -273,8 +274,12 @@ void TCPServer::handle_client(EpollLoop& loop, ConnectionManager& connections, i
         }
 
         if (status == ParseStatus::Complete) {
+            metrics.request_started();
+            const auto request_started_at = Metrics::Clock::now();
             const HttpResponse response = router.route(connection->parser.request(),
                                                        connection->client_ip);
+            metrics.request_completed(response.status_code,
+                                      Metrics::Clock::now() - request_started_at);
             const string serialized = response.to_string();
             if (connection->pending_bytes() + serialized.size() > max_outbound_bytes) {
                 close_client(loop, connections, client_fd);
@@ -348,7 +353,7 @@ void TCPServer::close_client(EpollLoop& loop, ConnectionManager& connections, in
     loop.remove_fd(client_fd);
     if (connections.get(client_fd) != nullptr) {
         connections.remove(client_fd);
-        active_connections.fetch_sub(1, memory_order_relaxed);
+        metrics.connection_closed();
     }
     close(client_fd);
 }

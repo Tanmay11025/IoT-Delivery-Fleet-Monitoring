@@ -12,10 +12,15 @@ API evolve independently from the efficient consumer-facing stream format.
 - `GET /health` returns `{"status":"ok"}` as JSON.
 - `GET /connections` returns the current process-wide active connection count
   as JSON, for example `{"connections":3}`.
+- `GET /metrics` returns Prometheus text exposition with active and accepted
+  connections, routed requests, rate-limit rejections, parser errors, response
+  classes, router-dispatch duration, and process uptime.
 
-The connection count is maintained with an atomic counter because each worker
-owns a separate connection map. The endpoint reports the aggregate count
-without reading another worker's map.
+The connection count is maintained atomically because each worker owns a
+separate connection map. `gateway_http_requests_total` counts complete parsed
+requests before routing; malformed requests increment the separate parser-error
+counter. A scrape counts as a request and an active connection. Its response
+class and duration are recorded after the scrape output is generated.
 
 ## Telemetry Event
 

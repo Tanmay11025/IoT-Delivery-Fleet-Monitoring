@@ -12,6 +12,7 @@ add_executable(message_gateway
 	src/http/http_response.cpp
 	src/http/router.cpp
 	src/security/rate_limiter.cpp
+	src/monitoring/metrics.cpp
 	src/network/connection_manager.cpp
 	src/network/epoll_loop.cpp
 	src/network/tcp_server.cpp
@@ -42,3 +43,12 @@ add_executable(rate_limiter_tests
 target_include_directories(rate_limiter_tests PRIVATE src)
 target_compile_options(rate_limiter_tests PRIVATE -Wall -Wextra -Wpedantic)
 add_test(NAME rate_limiter_tests COMMAND rate_limiter_tests)
+
+add_executable(metrics_tests
+	tests/metrics_test.cpp
+	src/monitoring/metrics.cpp
+)
+
+target_include_directories(metrics_tests PRIVATE src)
+target_compile_options(metrics_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME metrics_tests COMMAND metrics_tests)

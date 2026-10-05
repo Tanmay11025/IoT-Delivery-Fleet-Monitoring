@@ -243,6 +243,8 @@ The executable currently registers:
 
 - `GET /health` -> `{"status":"ok"}`.
 - `GET /connections` -> the aggregate active connection count as JSON.
+- `GET /metrics` -> Prometheus text metrics for connections, requests,
+  rejections, parser errors, request duration, and uptime.
 
 The active count is atomic because each worker owns a separate connection map.
 

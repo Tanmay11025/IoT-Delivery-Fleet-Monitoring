@@ -3,16 +3,39 @@
 
 #include <cassert>
 #include <chrono>
-#include <thread>
 
 void token_bucket_allows_burst_and_refills() {
-    TokenBucket bucket(2.0, 10.0);
+    using Clock = std::chrono::steady_clock;
+    auto now = Clock::time_point{};
+    TokenBucket bucket(2.0, 10.0, [&now] { return now; });
     assert(bucket.consume());
     assert(bucket.consume());
     assert(!bucket.consume());
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(120));
+    now += std::chrono::milliseconds(100);
     assert(bucket.consume());
+    assert(!bucket.consume());
+}
+
+void token_bucket_caps_refill_at_capacity() {
+    using Clock = std::chrono::steady_clock;
+    auto now = Clock::time_point{};
+    TokenBucket bucket(2.0, 10.0, [&now] { return now; });
+    assert(bucket.consume());
+
+    now += std::chrono::seconds(10);
+    assert(bucket.consume());
+    assert(bucket.consume());
+    assert(!bucket.consume());
+}
+
+void token_bucket_does_not_refill_without_elapsed_time() {
+    using Clock = std::chrono::steady_clock;
+    auto now = Clock::time_point{};
+    TokenBucket bucket(1.0, 0.0, [&now] { return now; });
+    assert(bucket.consume());
+    now += std::chrono::hours(1);
+    assert(!bucket.consume());
 }
 
 void rate_limiter_tracks_ips_independently() {
@@ -40,6 +63,8 @@ void router_rejects_before_handler_dispatch() {
 
 int main() {
     token_bucket_allows_burst_and_refills();
+    token_bucket_caps_refill_at_capacity();
+    token_bucket_does_not_refill_without_elapsed_time();
     rate_limiter_tracks_ips_independently();
     router_rejects_before_handler_dispatch();
     return 0;

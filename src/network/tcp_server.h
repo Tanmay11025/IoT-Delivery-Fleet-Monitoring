@@ -21,6 +21,7 @@
 #include "../http/router.h"
 #include "connection_manager.h"
 #include "epoll_loop.h"
+#include "../monitoring/metrics.h"
 
 using namespace std;
 
@@ -62,7 +63,11 @@ public:
     unsigned int get_worker_count() const { return worker_count; }
 
     size_t active_connection_count() const {
-        return active_connections.load(memory_order_relaxed);
+        return metrics.active_connections();
+    }
+
+    string metrics_text() const {
+        return metrics.prometheus_text();
     }
 
     void add_route(string method, string path, Router::Handler handler) {
@@ -96,7 +101,7 @@ private:
     int backlog;
     unsigned int worker_count;
     atomic<bool> worker_failed{false};
-    atomic<size_t> active_connections{0};
+    Metrics metrics;
     vector<thread> workers;
     Router router;
 };

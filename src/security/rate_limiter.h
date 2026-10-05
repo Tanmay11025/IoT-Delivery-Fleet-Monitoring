@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <cstddef>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -9,7 +10,10 @@
 // Tracks request permits for one client using a token bucket.
 class TokenBucket {
 public:
-    TokenBucket(double capacity, double refill_rate);
+    using Clock = std::function<std::chrono::steady_clock::time_point()>;
+
+    TokenBucket(double capacity, double refill_rate,
+                Clock clock = [] { return std::chrono::steady_clock::now(); });
 
     // Refill based on elapsed monotonic time and consume one permit if available.
     bool consume();
@@ -18,6 +22,7 @@ private:
     double capacity;
     double tokens;
     double refill_rate;
+    Clock clock;
     std::chrono::steady_clock::time_point last_refill_time;
 };
 
