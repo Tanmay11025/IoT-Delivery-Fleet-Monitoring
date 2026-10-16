@@ -1,5 +1,7 @@
 #include "tcp_server.h"
 
+#include <sys/eventfd.h>
+
 
 
 // Signal handlers do no I/O or locking: they only update this shared flag.
@@ -9,7 +11,7 @@ static_assert(atomic<bool>::is_always_lock_free);
 atomic<bool> shutdown_requested{false};
 
 // Request a clean event-loop shutdown when Ctrl+C is pressed.
-void handle_sigint(int) {
+void handle_shutdown_signal(int) {
     shutdown_requested.store(true, memory_order_relaxed);
 }
 
@@ -78,14 +80,14 @@ int create_reuseport_listener(int port, int backlog) {
     return listener_fd;
 }
 
-TCPServer::TCPServer(int port, int backlog, unsigned int worker_count,
-                                         double rate_limit_capacity, double rate_limit_refill_rate)
-    : port(port),
-      backlog(backlog),
-      worker_count(worker_count == 0
-                       ? max(1u, thread::hardware_concurrency())
-                                             : worker_count),
-            router(rate_limit_capacity, rate_limit_refill_rate) {}
+TCPServer::TCPServer(Config config)
+        : config(std::move(config)),
+            epoll_worker_count(this->config.epoll_worker_count == 0
+                                                         ? max(1u, thread::hardware_concurrency())
+                                                         : this->config.epoll_worker_count),
+            router(this->config.rate_limit_capacity, this->config.rate_limit_refill_rate) {
+        this->config.validate();
+}
 
 TCPServer::~TCPServer() {
     stop();
@@ -99,10 +101,17 @@ TCPServer::~TCPServer() {
 bool TCPServer::start() {
     shutdown_requested.store(false, memory_order_relaxed);
     worker_failed.store(false, memory_order_relaxed);
-    workers.reserve(worker_count);
+    try {
+        thread_pool = make_unique<ThreadPool>(config.thread_pool_size,
+                                              config.task_queue_capacity);
+    } catch (const exception& exception) {
+        cerr << "Unable to start request thread pool: " << exception.what() << '\n';
+        return false;
+    }
+    workers.reserve(epoll_worker_count);
 
     try {
-        for (unsigned int worker_id = 0; worker_id < worker_count; ++worker_id) {
+        for (unsigned int worker_id = 0; worker_id < epoll_worker_count; ++worker_id) {
             workers.emplace_back(&TCPServer::worker_loop, this, worker_id);
         }
     } catch (const exception& exception) {
@@ -117,11 +126,14 @@ bool TCPServer::start() {
         }
     }
 
+    thread_pool->begin_shutdown();
+    thread_pool->join();
+
     return !worker_failed.load(memory_order_relaxed);
 }
 
 void TCPServer::worker_loop(unsigned int worker_id) {
-    const int listener_fd = create_reuseport_listener(port, backlog);
+    int listener_fd = create_reuseport_listener(config.port, config.backlog);
     if (listener_fd == -1) {
         worker_failed.store(true, memory_order_relaxed);
         shutdown_requested.store(true, memory_order_relaxed);
@@ -130,36 +142,85 @@ void TCPServer::worker_loop(unsigned int worker_id) {
 
     EpollLoop loop;
     ConnectionManager connections;
+    LoopState state;
+    state.completion_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    if (state.completion_fd == -1) {
+        perror("eventfd");
+        close(listener_fd);
+        worker_failed.store(true, memory_order_relaxed);
+        shutdown_requested.store(true, memory_order_relaxed);
+        return;
+    }
+    if (!loop.add_fd(state.completion_fd, EPOLLIN)) {
+        close(state.completion_fd);
+        close(listener_fd);
+        worker_failed.store(true, memory_order_relaxed);
+        shutdown_requested.store(true, memory_order_relaxed);
+        return;
+    }
     if (!loop.add_fd(listener_fd, EPOLLIN)) {
+        close(state.completion_fd);
         close(listener_fd);
         worker_failed.store(true, memory_order_relaxed);
         shutdown_requested.store(true, memory_order_relaxed);
         return;
     }
 
-    Logger::info("Worker " + to_string(worker_id) + " listening on port " +
-                 to_string(port) + " with backlog " + to_string(backlog));
-    const bool loop_completed = loop.run([this, &loop, &connections, listener_fd](int fd,
-                                                                                   unsigned int events) {
-        handle_event(loop, connections, listener_fd, fd, events);
-    });
+    Logger::info("Epoll worker " + to_string(worker_id) + " listening on port " +
+                 to_string(config.port) + " with backlog " + to_string(config.backlog));
+    const bool loop_completed = loop.run(
+        [this, &loop, &connections, &state, &listener_fd](int fd, unsigned int events) {
+            handle_event(loop, connections, state, listener_fd, fd, events);
+        },
+        [this, &loop, &connections, &state, &listener_fd] {
+            process_completions(loop, connections, state);
+            if (shutdown_requested.load(memory_order_relaxed)) {
+                begin_drain(loop, connections, state, listener_fd);
+            }
+            if (state.draining) {
+                for (const int fd : connections.file_descriptors()) {
+                    Connection* connection = connections.get(fd);
+                    if (connection == nullptr || connection->request_in_flight) continue;
+                    if (connection->pending_bytes() != 0) flush_client(loop, connections, fd);
+                    else close_client(loop, connections, fd);
+                }
+            }
+        },
+        [&connections, &state] {
+            return state.draining && state.outstanding_tasks.load(std::memory_order_relaxed) == 0 &&
+                   connections.count() == 0;
+        });
     if (!loop_completed && !shutdown_requested.load(memory_order_relaxed)) {
         worker_failed.store(true, memory_order_relaxed);
         shutdown_requested.store(true, memory_order_relaxed);
     }
-    close(listener_fd);
+    if (listener_fd != -1) close(listener_fd);
+    close(state.completion_fd);
 }
 
 void TCPServer::handle_event(EpollLoop& loop, ConnectionManager& connections,
-                             int listener_fd, int fd, unsigned int events) {
+                             LoopState& state, int listener_fd, int fd,
+                             unsigned int events) {
+    if (shutdown_requested.load(memory_order_relaxed) && !state.draining) {
+        begin_drain(loop, connections, state, listener_fd);
+    }
+
+    if (fd == state.completion_fd) {
+        process_completions(loop, connections, state);
+        return;
+    }
+
+    if (fd != listener_fd && connections.get(fd) == nullptr) return;
+
     if (fd == listener_fd) {
+        if (state.draining) return;
         if (events & (EPOLLERR | EPOLLHUP)) {
             worker_failed.store(true, memory_order_relaxed);
             shutdown_requested.store(true, memory_order_relaxed);
             return;
         }
         if (events & EPOLLIN) {
-            accept_clients(loop, connections, listener_fd);
+            accept_clients(loop, connections, state, listener_fd);
         }
         return;
     }
@@ -171,7 +232,7 @@ void TCPServer::handle_event(EpollLoop& loop, ConnectionManager& connections,
     }
 
     if (events & EPOLLIN) {
-        handle_client(loop, connections, fd);
+        handle_client(loop, connections, state, fd);
         if (connections.get(fd) == nullptr) {
             return;
         }
@@ -191,14 +252,16 @@ void TCPServer::handle_event(EpollLoop& loop, ConnectionManager& connections,
     }
 
     connection = connections.get(fd);
-    if (connection != nullptr && connection->peer_closed && connection->pending_bytes() == 0) {
+    if (connection != nullptr && !connection->request_in_flight &&
+        connection->peer_closed && connection->pending_bytes() == 0) {
         close_client(loop, connections, fd);
     }
 }
 
 void TCPServer::accept_clients(EpollLoop& loop, ConnectionManager& connections,
-                               int listener_fd) {
+                               LoopState& state, int listener_fd) {
     while (true) {
+    if (shutdown_requested.load(memory_order_relaxed)) return;
         sockaddr_in client_addr{};
         socklen_t client_addr_len = sizeof(client_addr);
         const int client_fd = accept(listener_fd, reinterpret_cast<sockaddr*>(&client_addr),
@@ -227,12 +290,13 @@ void TCPServer::accept_clients(EpollLoop& loop, ConnectionManager& connections,
             continue;
         }
 
-        connections.add(client_fd, client_ip);
+        connections.add(client_fd, client_ip, state.next_generation++);
         metrics.connection_opened();
     }
 }
 
-void TCPServer::handle_client(EpollLoop& loop, ConnectionManager& connections, int client_fd) {
+void TCPServer::handle_client(EpollLoop& loop, ConnectionManager& connections,
+                              LoopState& state, int client_fd) {
     Connection* connection = connections.get(client_fd);
     if (connection == nullptr) {
         return;
@@ -275,18 +339,50 @@ void TCPServer::handle_client(EpollLoop& loop, ConnectionManager& connections, i
 
         if (status == ParseStatus::Complete) {
             metrics.request_started();
-            const auto request_started_at = Metrics::Clock::now();
-            const HttpResponse response = router.route(connection->parser.request(),
-                                                       connection->client_ip);
-            metrics.request_completed(response.status_code,
-                                      Metrics::Clock::now() - request_started_at);
-            const string serialized = response.to_string();
-            if (connection->pending_bytes() + serialized.size() > max_outbound_bytes) {
+            const std::uint64_t generation = connection->generation;
+            const HttpRequest request = connection->parser.request();
+            const string client_ip = connection->client_ip;
+            connection->request_in_flight = true;
+            if (!loop.modify_fd(client_fd, EPOLLRDHUP)) {
                 close_client(loop, connections, client_fd);
                 return;
             }
-            connection->outbound.append(serialized);
-            connection->peer_closed = true;
+
+            state.outstanding_tasks.fetch_add(1, memory_order_relaxed);
+            const bool accepted = thread_pool->submit(
+                [this, &state, client_fd, generation, request, client_ip] {
+                    const auto started = Metrics::Clock::now();
+                    HttpResponse response;
+                    try {
+                        response = router.route(request, client_ip);
+                    } catch (...) {
+                        response = HttpResponse{500, "Internal Server Error", {},
+                                                "Internal Server Error"};
+                    }
+                    Completion completion{client_fd, generation, response.to_string(),
+                                          response.status_code,
+                                          Metrics::Clock::now() - started};
+                    {
+                        lock_guard<mutex> lock(state.completion_mutex);
+                        state.completions.push(std::move(completion));
+                    }
+                    const std::uint64_t notification = 1;
+                    ssize_t result;
+                    do {
+                        result = write(state.completion_fd, &notification,
+                                       sizeof(notification));
+                    } while (result == -1 && errno == EINTR);
+                });
+            if (!accepted) {
+                state.outstanding_tasks.fetch_sub(1, memory_order_relaxed);
+                connection->request_in_flight = false;
+                const HttpResponse overloaded{503, "Service Unavailable", {},
+                                              "Service Unavailable"};
+                connection->outbound.append(overloaded.to_string());
+                connection->peer_closed = true;
+                metrics.request_completed(503, chrono::duration<double>::zero());
+                flush_client(loop, connections, client_fd);
+            }
             break;
         }
 
@@ -296,7 +392,59 @@ void TCPServer::handle_client(EpollLoop& loop, ConnectionManager& connections, i
         }
     }
 
-    flush_client(loop, connections, client_fd);
+    connection = connections.get(client_fd);
+    if (connection != nullptr && !connection->request_in_flight) {
+        flush_client(loop, connections, client_fd);
+    }
+}
+
+void TCPServer::process_completions(EpollLoop& loop, ConnectionManager& connections,
+                                    LoopState& state) {
+    std::uint64_t notifications;
+    while (read(state.completion_fd, &notifications, sizeof(notifications)) > 0) {}
+
+    queue<Completion> completed;
+    {
+        lock_guard<mutex> lock(state.completion_mutex);
+        swap(completed, state.completions);
+    }
+    while (!completed.empty()) {
+        Completion completion = std::move(completed.front());
+        completed.pop();
+        metrics.request_completed(completion.status_code, completion.elapsed);
+        Connection* connection = connections.get(completion.client_fd);
+        if (connection != nullptr && connection->generation == completion.generation &&
+            connection->request_in_flight) {
+            connection->request_in_flight = false;
+            if (connection->pending_bytes() + completion.serialized_response.size() <=
+                max_outbound_bytes) {
+                connection->outbound.append(completion.serialized_response);
+                connection->peer_closed = true;
+                flush_client(loop, connections, completion.client_fd);
+            } else {
+                close_client(loop, connections, completion.client_fd);
+            }
+        }
+        state.outstanding_tasks.fetch_sub(1, memory_order_relaxed);
+    }
+}
+
+void TCPServer::begin_drain(EpollLoop& loop, ConnectionManager& connections,
+                            LoopState& state, int& listener_fd) {
+    if (state.draining) return;
+    state.draining = true;
+    thread_pool->begin_shutdown();
+    if (listener_fd != -1) {
+        loop.remove_fd(listener_fd);
+        close(listener_fd);
+        listener_fd = -1;
+    }
+    for (const int fd : connections.file_descriptors()) {
+        Connection* connection = connections.get(fd);
+        if (connection == nullptr || connection->request_in_flight) continue;
+        if (connection->pending_bytes() != 0) flush_client(loop, connections, fd);
+        else close_client(loop, connections, fd);
+    }
 }
 
 bool TCPServer::flush_client(EpollLoop& loop, ConnectionManager& connections, int client_fd) {

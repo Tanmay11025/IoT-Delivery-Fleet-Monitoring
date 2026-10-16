@@ -3,10 +3,10 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile
-    command: ["./build/message_gateway", "8080", "128", "1"]
-    environment:
-      RATE_LIMIT_CAPACITY: 1000
-      RATE_LIMIT_REFILL_RATE: 0
+    command:
+      ["./build/message_gateway", "--port", "8080", "--backlog", "128",
+       "--epoll-workers", "1", "--pool-threads", "4",
+       "--rate-limit-capacity", "1000", "--rate-limit-refill-rate", "0"]
     ulimits:
       nofile:
         soft: 200000

@@ -16,8 +16,7 @@ class Router {
 public:
     using Handler = function<HttpResponse(const HttpRequest&)>;
 
-    explicit Router(double rate_limit_capacity = 10.0,
-                    double rate_limit_refill_rate = 5.0);
+    explicit Router(double rate_limit_capacity, double rate_limit_refill_rate);
 
     // Register or replace a handler for a method/path pair.
     void add_route(string method, string path, Handler handler);

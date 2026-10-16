@@ -1,8 +1,8 @@
 #include "connection_manager.h"
 
 // Store a new client connection by its file descriptor.
-void ConnectionManager::add(int fd, string client_ip) {
-    connections.insert_or_assign(fd, Connection(fd, move(client_ip)));
+void ConnectionManager::add(int fd, string client_ip, std::uint64_t generation) {
+    connections.insert_or_assign(fd, Connection(fd, move(client_ip), generation));
 }
 
 // Erase a client connection from the active connection list.
@@ -22,4 +22,11 @@ Connection* ConnectionManager::get(int fd) {
 // Return how many client connections are currently active.
 size_t ConnectionManager::count() const {
     return connections.size();
+}
+
+std::vector<int> ConnectionManager::file_descriptors() const {
+    std::vector<int> descriptors;
+    descriptors.reserve(connections.size());
+    for (const auto& entry : connections) descriptors.push_back(entry.first);
+    return descriptors;
 }

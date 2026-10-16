@@ -15,154 +15,58 @@ to debug a reliable TCP foundation before adding parsing and application logic.
 
 ## 2. Implementation History
 
-### 2.1 Repository and build foundation
+### 2.1 Build and runtime configuration
 
-The project began with a CMake-based C++17 executable. The build uses strict
-compiler warnings:
+The gateway is a CMake-based C++17 executable built with `-Wall`, `-Wextra`,
+and `-Wpedantic`. `Config` centralizes the listening port, backlog, epoll worker
+count, request-pool size and queue capacity, log path, and rate-limit policy.
+Values load from a simple `key=value` file, and CLI options override file
+values. Configuration is validated before server startup; `config.example.ini`
+shows the supported settings.
 
-```text
--Wall -Wextra -Wpedantic
-```
+### 2.2 Socket lifecycle and nonblocking I/O
 
-`main.cpp` is the application entry point. CMake keeps compilation explicit,
-which makes the list of production files and test targets visible and makes the
-project easy to build locally or inside Docker.
+The server follows `socket -> setsockopt -> bind -> listen -> accept ->
+read/send -> close`. Listening and client sockets are nonblocking. `EAGAIN` and
+`EWOULDBLOCK` mean the current I/O operation has drained for now; `EINTR` is
+retried. Socket cleanup is centralized in `TCPServer` helpers.
 
-The command-line configuration supports:
+### 2.3 Logging and event loop
 
-```text
-message_gateway [port] [backlog] [workers]
-```
+`Logger` serializes timestamped output and can write to the configured log
+path. `EpollLoop` uses level-triggered Linux `epoll`; it drains readable data
+until `EAGAIN`, enables `EPOLLOUT` only when output is pending, and runs a
+periodic drain callback so shutdown progresses even without socket activity.
 
-Arguments are parsed and validated before the server starts. Invalid ports,
-backlogs, worker counts, or extra arguments are rejected early rather than
-allowing a partially configured server to run.
+### 2.4 Connection ownership and buffering
 
-### 2.2 TCP server and socket lifecycle
+Each epoll worker owns one listener, event loop, and `ConnectionManager`.
+Connections contain their parser, inbound/outbound buffers, partial-write
+offset, peer-close state, in-flight flag, and generation token. A 1 MiB
+per-connection output limit bounds slow-reader memory use. The generation token
+prevents a late asynchronous response from being applied to a new connection
+that reused the same file descriptor.
 
-The first working server established the normal TCP lifecycle:
+### 2.5 Epoll workers and request pool
 
-```text
-socket -> setsockopt -> bind -> listen -> accept -> read/send -> close
-```
+`SO_REUSEPORT` distributes newly accepted connections among the configured
+epoll workers. Those workers keep all connection mutation and socket I/O
+thread-confined. Once an HTTP request is complete, the epoll worker submits a
+copy of the request and client IP to one shared, fixed-size `ThreadPool`. Its
+bounded queue rejects excess work with `503 Service Unavailable`. Pool threads
+perform routing and serialization, then post the result to the owning epoll
+worker through a protected completion queue and `eventfd`. Only the owner
+checks the connection generation, appends output, and sends the response.
 
-The server creates an IPv4 TCP listening socket, binds it to the configured
-port, starts listening, accepts client connections, and closes resources during
-normal shutdown or failure.
+### 2.6 Shutdown and failure handling
 
-Socket ownership was then moved into the `TCPServer` abstraction. Cleanup is
-centralized in destructors and close helpers so that error paths do not leave
-file descriptors open. This RAII-style ownership was chosen because sockets are
-operating-system resources and manual cleanup scattered across many branches
-is easy to get wrong.
-
-### 2.3 Centralized logging
-
-`src/core/logger.h` provides timestamped logging for server events. Logging is
-centralized so worker startup and other operational messages use one format.
-Output is protected from interleaving between worker threads.
-
-The server does not log every byte or every connection by default. That choice
-keeps logging from becoming a performance bottleneck during connection ramps.
-
-### 2.4 Nonblocking I/O
-
-Listening and client sockets are configured with `O_NONBLOCK`. A blocking
-socket could make a worker wait indefinitely for one slow client. A nonblocking
-socket returns immediately when no operation can currently proceed.
-
-The implementation treats `EAGAIN` and `EWOULDBLOCK` as normal flow-control
-signals, not as fatal errors. The event loop can then move on to other clients.
-`EINTR` is retried because an interrupted system call is not a connection
-failure by itself.
-
-This approach was chosen because the gateway is expected to keep many network
-connections open at the same time. It prevents one idle or slow connection from
-stopping progress for the rest of the worker.
-
-### 2.5 Epoll event loop
-
-`EpollLoop` wraps Linux `epoll`. It registers file descriptors, waits for
-readable or writable events, modifies interest masks, and removes descriptors
-when they close.
-
-The loop uses level-triggered events. It processes a ready descriptor until
-`read()` or `accept()` returns `EAGAIN`, which ensures that all currently
-available work is drained before the loop waits again.
-
-The listener watches `EPOLLIN`. Client sockets watch `EPOLLIN` and
-`EPOLLRDHUP`; `EPOLLOUT` is enabled only when queued output cannot be sent
-immediately. This avoids waking the event loop for writable sockets that have
-nothing to send.
-
-`epoll` was chosen instead of polling every connection or creating one blocking
-thread per client because the kernel reports only descriptors with activity.
-That reduces wasted CPU and gives one worker a low-memory way to manage many
-connections.
-
-### 2.6 Connection management
-
-`ConnectionManager` stores active connections in a map keyed by file descriptor.
-Each worker owns its own manager. A `Connection` currently contains:
-
-```text
-file descriptor
-HTTP parser
-inbound buffer
-outbound buffer
-outbound offset
-peer-closed state
-```
-
-Keeping state per connection is necessary because TCP is a byte stream. One
-request may arrive in many reads, and one read may contain more data than the
-server can process immediately.
-
-The outbound buffer supports partial writes. If `send()` writes only part of
-the response, `outbound_offset` identifies the first byte still waiting. The
-server enables `EPOLLOUT` and resumes from that offset later instead of copying
-the remaining data after every write.
-
-A per-connection outbound limit of 1 MiB protects the process from a slow
-receiver or a client that intentionally causes output to accumulate. When the
-limit is exceeded, the connection is closed. This is a deliberate resource
-policy: protecting all active clients is more important than retaining one
-unbounded queue.
-
-### 2.7 Worker scaling with `SO_REUSEPORT`
-
-The server can start multiple worker threads. Each worker owns:
-
-```text
-one listening socket
-one EpollLoop
-one ConnectionManager
-```
-
-Each listener uses `SO_REUSEPORT`, allowing multiple sockets in the same
-process to bind the same port. Linux distributes new connections among those
-listeners. Once accepted, a client remains with the worker that accepted it.
-
-This ownership model was chosen to avoid transferring connection state between
-threads. The normal connection path is therefore thread-confined: the worker
-can access its connection map and buffers without a lock for every read or
-write. More workers can use more CPU cores while preserving simple local state.
-
-The worker count is configurable. A value of `0` selects the number of hardware
-threads reported by the system, with at least one worker.
-
-### 2.8 Shutdown and failure handling
-
-`SIGINT` sets a shared atomic shutdown flag. Workers observe that flag between
-epoll waits and leave their loops. The server joins worker threads before
-returning.
-
-Hard listener errors stop the server. Client errors remove the descriptor from
-epoll, erase its connection state, and close the socket. A peer half-close is
-tracked so already queued output can be flushed before the connection closes.
-
-These choices make shutdown predictable and keep cleanup in one place instead
-of depending on the operating system to reclaim resources after an abrupt exit.
+`SIGINT` and `SIGTERM` set an atomic shutdown flag. Epoll workers stop
+accepting connections and new tasks, close idle or incomplete clients, and
+remain active to process completions. The pool rejects submissions after
+shutdown begins and drains all accepted tasks. Each epoll loop exits only when
+its outstanding tasks and connections are gone; the server then joins the
+epoll threads and pool workers. Hard listener errors trigger the same drain
+path, while client errors remove the descriptor and close the connection.
 
 ## 3. Load Testing and Container Support
 
@@ -235,9 +139,11 @@ read until EAGAIN
     -> feed bytes to HTTPParser
     -> wait if status is Incomplete
     -> create a 400 response if status is Error
-    -> route only if status is Complete
-    -> serialize the response
-    -> queue it for nonblocking output
+    -> submit a copy of the complete request to the bounded pool
+    -> route and serialize in a pool worker
+    -> post completion through the owning loop's eventfd
+    -> validate connection generation and queue response on epoll thread
+    -> send through the existing nonblocking output path
 ```
 
 The existing outbound queue and partial-write logic are reused for HTTP
@@ -284,7 +190,9 @@ The executable currently registers these endpoints:
   `gateway_connections_accepted_total`, `gateway_http_requests_total`,
   `gateway_http_requests_blocked_total`, `gateway_http_parse_errors_total`,
   `gateway_http_responses_total` grouped by status class,
-  `gateway_http_request_duration_seconds`, and `process_uptime_seconds`.
+  `gateway_http_request_duration_seconds`, `process_uptime_seconds`,
+  `gateway_thread_pool_workers`, `gateway_thread_pool_busy_threads`, and
+  `gateway_thread_pool_queue_length`.
 - `GET /large-response` returns a deterministic 512 KiB body for transport
   tests of slow readers and partial writes.
 
@@ -292,8 +200,9 @@ The metrics collector counts each complete parsed request immediately before
 router dispatch; malformed requests are counted separately. Rate-limited
 requests are included in both request and blocked-request totals. A `/metrics`
 scrape counts as a request and active connection, while its response class and
-duration are recorded after the exposition is generated. The duration metric
-covers router dispatch, not request parsing or socket transmission.
+duration are recorded after the exposition is generated. Request duration
+covers pool execution, routing, and serialization; it excludes queue wait,
+request parsing, and socket transmission.
 
 Each worker still owns its own `ConnectionManager`, so the connection count is
 maintained separately as an atomic counter on `TCPServer`. The counter is
@@ -310,10 +219,11 @@ transport test surface, not a telemetry feature: the body consists of repeated
 `x` bytes so a raw-socket client can verify the exact `Content-Length` and
 payload while reading slowly.
 
-The router also owns a shared, mutex-protected per-IP token-bucket limiter. Its
-production default policy allows a burst of 10 requests and refills at 5
-requests per second. `RATE_LIMIT_CAPACITY` and `RATE_LIMIT_REFILL_RATE` may
-override these values at process startup for controlled test environments.
+The router also owns a shared per-IP token-bucket limiter. The IP map uses a
+`shared_mutex` for existing-entry lookup and exclusive insertion; each bucket
+has its own mutex because consuming a token mutates its state. Defaults allow a
+burst of 10 requests and refill at 5 requests per second. Both values come from
+`Config` and can be overridden in the config file or CLI.
 When a bucket is empty, routing returns `429 Too Many Requests` before the
 application handler is called.
 
@@ -372,6 +282,20 @@ raw-socket HTTP integration     -> real TCP server, parser, router, responses
 slow-reader integration         -> partial writes and EPOLLOUT backpressure
 50,000-client Docker load test  -> connection-scale stability and retention
 ```
+
+Focused C++ tests also cover config-file/CLI precedence, pool queue capacity and
+drain semantics, exception survival, concurrent same-IP rate limiting, and a
+blocked handler completing during the server's SIGTERM shutdown path. Run the
+compiled test suite with:
+
+```bash
+cmake -S . -B build
+cmake --build build
+ctest --test-dir build --output-on-failure
+```
+
+The HTTP integration metrics check verifies `gateway_thread_pool_workers`,
+`gateway_thread_pool_busy_threads`, and `gateway_thread_pool_queue_length`.
 
 The suite intentionally does not test telemetry JSON validation yet because
 `POST /publish` has not been implemented. Once that handler exists, the same
@@ -438,15 +362,17 @@ in one callback.
 Implemented today:
 
 - CMake/C++17 build with compiler warnings.
-- Configurable port, backlog, and worker count.
+- Config-file and CLI runtime settings for port, backlog, epoll workers, pool
+  size, queue capacity, log path, and rate limiting.
 - IPv4 TCP listener setup and cleanup.
 - Centralized timestamped logging.
 - Nonblocking sockets and `EAGAIN` handling.
 - Linux epoll event loop.
 - Per-worker connection management.
 - `SO_REUSEPORT` worker scaling.
+- Bounded shared request pool with eventfd completions returned to connection owners.
 - Partial-write handling and bounded outbound buffering.
-- Graceful signal shutdown and client cleanup.
+- SIGINT/SIGTERM graceful draining of accepted tasks and client cleanup.
 - Docker build and concurrent TCP connection-ramp testing.
 - Incremental HTTP request parsing.
 - HTTP response serialization.
@@ -459,6 +385,8 @@ Implemented today:
   concurrent, size-limit, routing, connection-close, and slow-reader cases.
 - Focused C++ rate-limiter tests for burst/refill behavior, per-IP isolation,
   and handler bypass on `429 Too Many Requests`.
+- Config, pool saturation/drain, concurrent limiter, and server shutdown tests.
+- Pool worker, busy-thread, and queue-length metrics.
 - A deterministic large-response endpoint for testing partial response writes.
 - Telemetry event documentation.
 

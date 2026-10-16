@@ -1,52 +1,23 @@
 #include "network/tcp_server.h"
 
-// Convert one command-line value to an integer and reject invalid text.
-bool parse_argument(const char* value, const char* name, int& result) {
-    stringstream input(value);
-    char extra_character;
-
-    if (!(input >> result) || input >> extra_character) {
-        cerr << "Invalid " << name << ": expected an integer\n";
-        return false;
-    }
-
-    return true;
-}
-
 int main(int argc, char* argv[]) {
-    signal(SIGINT, handle_sigint);
-    
-    // The optional arguments are: port, connection backlog, and worker count.
-    if (argc > 4) {
-        cerr << "Usage: " << argv[0] << " [port] [backlog] [workers]\n";
+    Config config;
+    try {
+        config = Config::from_args(argc, argv);
+        Logger::set_file(config.log_path);
+    } catch (const exception& error) {
+        cerr << error.what() << '\n'
+             << "Usage: " << argv[0]
+             << " [--config path] [--port n] [--backlog n] [--epoll-workers n]"
+                " [--pool-threads n] [--queue-capacity n] [--log-path path]"
+                " [--rate-limit-capacity n] [--rate-limit-refill-rate n]\n";
         return EXIT_FAILURE;
     }
 
-    int port = 8080;
-    int backlog = 128;
-    int workers = 0;
-    if ((argc > 1 && !parse_argument(argv[1], "port", port)) ||
-        (argc > 2 && !parse_argument(argv[2], "backlog", backlog)) ||
-        (argc > 3 && !parse_argument(argv[3], "workers", workers))) {
-        return EXIT_FAILURE;
-    }
+    signal(SIGINT, handle_shutdown_signal);
+    signal(SIGTERM, handle_shutdown_signal);
 
-    if (port < 1 || port > 65535 || backlog < 1 || workers < 0) {
-        cerr << "Error: port must be between 1 and 65535, backlog must be positive, "
-             << "and workers must not be negative\n";
-        return EXIT_FAILURE;
-    }
-
-    // The server object owns the socket and cleans it up automatically.
-    // Tests may override the limiter policy without changing production defaults.
-    const double rate_limit_capacity = getenv("RATE_LIMIT_CAPACITY") == nullptr
-                                           ? 10.0
-                                           : stod(getenv("RATE_LIMIT_CAPACITY"));
-    const double rate_limit_refill_rate = getenv("RATE_LIMIT_REFILL_RATE") == nullptr
-                                              ? 5.0
-                                              : stod(getenv("RATE_LIMIT_REFILL_RATE"));
-    TCPServer server(port, backlog, static_cast<unsigned int>(workers),
-                     rate_limit_capacity, rate_limit_refill_rate);
+    TCPServer server(config);
     server.add_route("GET", "/health", [](const HttpRequest&) {
         return HttpResponse{200, "OK", {{"Content-Type", "application/json"}},
                             "{\"status\":\"ok\"}"};
