@@ -2,13 +2,17 @@
 
 ## 1. Build and Unit-Test Results
 
-The latest confirmed CTest run was executed after building the new drain-test
-target and completed all six registered C++ tests successfully. The commands
-were:
+A full build and CTest run after registering individual cases completed
+successfully: all 31 C++ test cases passed. The build emitted a repeated
+`backslash-newline at end of file` warning from `tests/test_runner.h`; the
+macro was subsequently reformatted to remove the line continuation. That
+warning-only edit has not yet been rebuilt and rerun in the reported output.
+
+The earlier focused recovery/integration and full-suite runs used:
 
 ```bash
-cmake --build build --target tcp_server_drain_tests
-ctest --test-dir build -R '^tcp_server_drain_tests$' --output-on-failure
+cmake --build build --target mmap_log_tests tcp_server_drain_tests
+ctest --test-dir build -R '^(mmap_log_tests|tcp_server_drain_tests)$' --output-on-failure
 ctest --test-dir build --output-on-failure
 ```
 
@@ -21,17 +25,45 @@ metrics_tests       Passed
 config_tests        Passed
 thread_pool_tests   Passed
 tcp_server_drain_tests Passed
+mmap_log_tests      Passed
+circular_buffer_tests Passed
 
-100% tests passed, 0 tests failed out of 6
-Total Test time (real) = 0.03 sec
+100% tests passed, 0 tests failed out of 8
+Total Test time = 0.06 sec
+```
+
+The focused rerun before the full per-case registration was:
+
+```bash
+cmake --build build --target tcp_server_drain_tests
+./build/tcp_server_drain_tests
+```
+
+The target built successfully and the test executable exited with code `0`.
+Its `/recent?count=1` assertion now checks that the single returned message is
+the newest, escaped-payload seed rather than the preceding message.
+
+The latest full run was performed with:
+
+```bash
+cmake -S . -B build
+cmake --build build --parallel 2
+ctest --test-dir build --output-on-failure
+```
+
+CTest reported each named case individually, ending with:
+
+```text
+100% tests passed, 0 tests failed out of 31
+Total Test time (real) = 0.16 sec
 ```
 
 The C++ test targets and their verified behavior are:
 
 - `http_parser_tests`: fragmented headers and bodies, `Content-Length`
 	completion, requests without bodies, case-insensitive header lookup,
-	malformed requests, conflicting lengths, unsupported chunked encoding, and
-	header/body size limits.
+	query/path separation, malformed requests, conflicting lengths, unsupported
+	chunked encoding, and header/body size limits.
 - `rate_limiter_tests`: fake-clock token-bucket burst/refill/cap behavior,
 	zero-rate behavior, independent IP buckets, 429 handler bypass, and
 	concurrent same-IP consumption capped at the bucket's 20-token capacity.
@@ -45,13 +77,22 @@ The C++ test targets and their verified behavior are:
 - `tcp_server_drain_tests`: an in-flight route handler is held while the server
 	receives the SIGTERM shutdown signal; after release, the response is
 	delivered before the server thread joins, and the pool worker metric is
-	present. This test also caught a missing `src/core/config.cpp` source in its
-	CMake target; linking that source fixed the undefined `Config::validate()`
-	reference, after which the focused test and full suite passed.
+	present. It appends three messages through the server API, checks chronological
+	ordering, verifies `count=1` selects the newest escaped payload, checks JSON
+	escaping, and verifies segment-file bytes in `/metrics`. The updated target
+	passed in both its focused rerun and the 31-case CTest run.
+- `mmap_log_tests`: append/read across close and reopen, variable and empty
+	payloads, global offsets across segment rollover, exact-fit rollover,
+	oversized-record rejection, incomplete-header/payload recovery, detection of
+	payload bytes left before a missing header, active-tail checksum rejection,
+	and fatal corruption in a sealed segment. All expanded cases passed in the
+	latest 31-case CTest run.
+- `circular_buffer_tests`: chronological reads before and after wraparound,
+	exact-capacity fills, zero/oversized reads, and capacity-one replacement.
 
-The pool-metric gauges are asserted by the HTTP integration test, not by
-`metrics_tests`: the integration check requires worker count, busy-thread count,
-and queue length samples and verifies their values are within expected bounds.
+`metrics_tests` verifies the log disk-byte gauge. The HTTP integration test
+checks the pool gauges, disk usage, and an empty `/recent` response through the
+running server.
 
 ## 2. HTTP Verification Results
 
@@ -76,7 +117,7 @@ an HTTP request one byte at a time.
 
 ### Tests used
 
-The suite in `tests/http_integration_test.py` contains eleven checks:
+The suite in `tests/http_integration_test.py` contains twelve checks:
 
 1. A normal `GET /health` request and response body.
 2. A byte-by-byte `GET /health` request with a small delay between writes.
@@ -88,8 +129,11 @@ The suite in `tests/http_integration_test.py` contains eleven checks:
 8. Exact routing for valid and unknown method/path pairs.
 9. One hundred concurrent raw-socket HTTP clients.
 10. A slow reader consuming the 512 KiB `/large-response` body in small chunks.
-11. The `/metrics` endpoint's exposition format, required samples, and scrape
-    counter behavior.
+11. `GET /recent` returns JSON from the in-memory cache; count query tests cover
+	zero, selection of the newest item, malformed values, unknown/repeated
+	parameters, and the configured upper bound.
+12. The `/metrics` endpoint's exposition format, required samples, and scrape
+	counter behavior, including the thread-pool and log-disk gauges.
 
 ### How the test was run
 
@@ -138,18 +182,15 @@ PASS test_size_limits
 PASS test_routing
 PASS test_concurrent_clients
 PASS test_slow_reader_partial_response
+PASS test_recent_endpoint
 PASS test_metrics_endpoint
-PASS all HTTP integration tests (11)
+PASS all HTTP integration tests (12)
 http-test exited with code 0
 ```
 
-**Chronology:** this recorded HTTP run predates the shared request-pool
-implementation. The integration test was subsequently extended to require
-`gateway_thread_pool_workers`, `gateway_thread_pool_busy_threads`, and
-`gateway_thread_pool_queue_length`, and the Compose service was updated to use
-the new CLI options. That updated Docker HTTP suite has not yet been recorded as
-run, so the output above is historical transport evidence and does not verify
-the new asynchronous request handoff or pool gauges.
+The suite was rerun after adding the request pool and persistent storage; the
+latest `./scripts/run_http_integration_test.sh` invocation exited with code 0.
+The cases now also verify `/recent`, pool gauges, and log segment-file bytes.
 
 Docker later stopped the gateway as part of Compose teardown. Its exit code
 `137` is expected in this setup because `--abort-on-container-exit` stops the
@@ -158,9 +199,9 @@ HTTP test container's exit code `0`.
 
 ### What the results signify
 
-This run demonstrated that the HTTP transport at that time worked through the
+The successful runs demonstrate that the HTTP transport works through the
 real TCP server for normal, fragmented, malformed, concurrent, and
-backpressured traffic. In particular, it showed that:
+backpressured traffic. In particular, they show that:
 
 - The parser assembles requests delivered in tiny fragments.
 - The parser does not route before headers and the declared body are complete.
@@ -176,13 +217,12 @@ backpressured traffic. In particular, it showed that:
 
 ### Metrics endpoint verification
 
-The recorded pre-pool integration run exercised `/metrics` using the same
-raw-socket HTTP client as the other endpoint tests. It checked the Prometheus
-content type and required connection, request, parser-error, response-class,
-duration-histogram, and uptime samples. The later, updated test also checks the
-three pool gauges, but that revision has not yet been run. The recorded run
-performed repeated scrapes and verified that the request counter advances
-between them and that the histogram count reflects completed requests.
+The updated integration test exercises `/metrics` using the same raw-socket
+client as the other endpoint tests. It checks the Prometheus content type and
+required connection, request, parser-error, response-class, duration-histogram,
+uptime, pool worker/busy/queue, and log disk-byte samples. It performs repeated
+scrapes and verifies that the request counter advances between them and that
+the histogram count reflects completed requests.
 
 The endpoint was also checked manually while the gateway was running:
 
@@ -460,13 +500,13 @@ pure connection setup time or as a per-request latency measurement.
 
 ### 6.1 What the results demonstrate
 
-The current six-test CTest run demonstrates that the parser and metrics unit
-tests pass, configuration precedence and validation behave as expected, pool
-queue bounds and accepted-task draining work, concurrent same-IP limiter
-checks respect the token capacity, and the server delivers an in-flight
-handler's response while shutting down on SIGTERM. The older Docker HTTP run
-and connection-ramp measurements below provide separate historical evidence
-for the pre-pool transport and connection-scaling implementation.
+The current eight-test CTest run demonstrates parser and metrics behavior,
+configuration precedence and validation, pool queue bounds and accepted-task
+draining, concurrent same-IP limiter enforcement, SIGTERM response draining,
+log recovery and segment rollover, and circular-cache ordering and boundaries.
+The updated Docker HTTP suite also passed after the pool and storage changes,
+covering recent-message counts and pool/log metrics. The 50,000-client
+connection ramp remains historical evidence from the pre-pool transport.
 
 The successful ramp from 1,000 through 50,000 connections demonstrates that
 the current network foundation can:
@@ -498,31 +538,30 @@ local TCP endpoints.
 
 The available results do not yet prove:
 
-- HTTP throughput or latency for the new request-pool implementation.
-- End-to-end HTTP routing, pool metrics, and response delivery through the
-	updated asynchronous request handoff; the modified Docker suite has not yet
-	been rerun.
+- HTTP throughput or latency under a dedicated benchmark of the request-pool
+  implementation.
 - Correct telemetry JSON validation.
 - A registered or functioning `POST /publish` application handler.
-- Production rate-limiting effectiveness under sustained HTTP load; current
-	tests verify token-bucket and concurrent same-IP behavior in isolation.
-- Slow-reader and output-backpressure behavior on the new pooled server; the
-	recorded HTTP run predates the pool change.
+- Production rate-limiting effectiveness under sustained HTTP load. Current
+	tests verify token-bucket/concurrent behavior and the integration suite
+	verifies concurrent HTTP clients, but no sustained security-load benchmark
+	has been run.
 - Durable telemetry storage or downstream broadcasting.
-- Recovery after a process crash or host failure.
+- Durability across sudden power loss; the tests verify close/reopen recovery
+  and malformed-tail recovery, not machine-level crash guarantees.
 - Multi-host load generation or production network performance.
 
 The results validate the historical transport foundation and connection
-scalability, and the new C++ configuration, pool, limiter-concurrency, and
-shutdown-drain behavior. They do not yet establish pooled-server performance
-or full end-to-end HTTP correctness after the architecture change, nor the
-complete fleet-monitoring product.
+scalability, the new C++ storage/pool/configuration behaviors, and end-to-end
+HTTP routing through the updated server. They do not establish dedicated
+pooled-server performance or the complete fleet-monitoring product.
 
 ## 7. Overall Result
 
 The project has moved from a basic TCP server to a scalable, event-driven
-transport with an incremental HTTP layer and a shared request pool. The six
-current C++ tests pass. Historical load results show that the earlier
-networking foundation maintained 50,000 simultaneous TCP clients under the
-recorded test configuration. Pooled-server performance and end-to-end HTTP
-integration remain to be measured with the updated test suite.
+transport with an incremental HTTP layer, shared request pool, and segmented
+persistent log. All eight current C++ tests pass, and the updated HTTP
+integration script exited successfully. Historical load results show that the
+earlier networking foundation maintained 50,000 simultaneous TCP clients under
+the recorded test configuration. Dedicated pooled-server performance
+measurements remain future work.

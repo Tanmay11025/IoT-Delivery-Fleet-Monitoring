@@ -15,6 +15,7 @@ using namespace std;
 struct HttpRequest {
     string method;                     // Example: GET, POST
     string path;                       // Example: /status
+    string query;                      // Raw query string without '?'.
     unordered_map<string, string> headers; // Header names are stored in lowercase.
     string body;                       // Request body, if there is one.
 };

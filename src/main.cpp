@@ -10,7 +10,9 @@ int main(int argc, char* argv[]) {
              << "Usage: " << argv[0]
              << " [--config path] [--port n] [--backlog n] [--epoll-workers n]"
                 " [--pool-threads n] [--queue-capacity n] [--log-path path]"
-                " [--rate-limit-capacity n] [--rate-limit-refill-rate n]\n";
+                     " [--rate-limit-capacity n] [--rate-limit-refill-rate n]"
+                     " [--storage-directory path] [--storage-segment-size bytes]"
+                     " [--recent-capacity n]\n";
         return EXIT_FAILURE;
     }
 
@@ -31,6 +33,9 @@ int main(int argc, char* argv[]) {
         return HttpResponse{200, "OK",
                             {{"Content-Type", "text/plain; version=0.0.4; charset=utf-8"}},
                             server.metrics_text()};
+    });
+    server.add_route("GET", "/recent", [&server](const HttpRequest& request) {
+        return server.recent_messages_response(request);
     });
     server.add_route("GET", "/large-response", [](const HttpRequest&) {
         // This deterministic payload exercises queued output and EPOLLOUT tests.

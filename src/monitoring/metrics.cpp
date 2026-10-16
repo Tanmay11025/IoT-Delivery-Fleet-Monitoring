@@ -52,7 +52,8 @@ std::size_t Metrics::active_connections() const {
 
 std::string Metrics::prometheus_text(std::size_t pool_workers,
                                      std::size_t busy_threads,
-                                     std::size_t queue_length) const {
+                                     std::size_t queue_length,
+                                     std::uint64_t log_disk_bytes) const {
     std::ostringstream output;
     output << std::setprecision(9);
     output << "# HELP gateway_connections_active Current open client connections.\n"
@@ -114,6 +115,9 @@ std::string Metrics::prometheus_text(std::size_t pool_workers,
             << "gateway_thread_pool_busy_threads " << busy_threads << '\n'
             << "# HELP gateway_thread_pool_queue_length Queued request tasks.\n"
             << "# TYPE gateway_thread_pool_queue_length gauge\n"
-            << "gateway_thread_pool_queue_length " << queue_length << '\n';
+               << "gateway_thread_pool_queue_length " << queue_length << '\n'
+               << "# HELP gateway_log_disk_bytes Provisioned bytes across pre-sized log segment files.\n"
+               << "# TYPE gateway_log_disk_bytes gauge\n"
+               << "gateway_log_disk_bytes " << log_disk_bytes << '\n';
     return output.str();
 }

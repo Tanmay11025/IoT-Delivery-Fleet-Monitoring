@@ -3,12 +3,27 @@
 #include <cassert>
 #include <chrono>
 #include <future>
+#include "test_runner.h"
 
 void pool_bounds_queue_and_drains_accepted_tasks() {
     ThreadPool pool(1, 1);
     std::promise<void> task_started;
     std::promise<void> release_task;
     const auto release = release_task.get_future().share();
+    bool release_signaled = false;
+    struct ReleaseOnExit {
+        std::promise<void>& release;
+        bool& signaled;
+        ~ReleaseOnExit() {
+            if (!signaled) release.set_value();
+        }
+        void signal() {
+            if (!signaled) {
+                release.set_value();
+                signaled = true;
+            }
+        }
+    } release_on_exit{release_task, release_signaled};
     std::promise<void> queued_task_done;
     auto queued_done = queued_task_done.get_future();
 
@@ -27,7 +42,7 @@ void pool_bounds_queue_and_drains_accepted_tasks() {
 
     pool.begin_shutdown();
     assert(!pool.submit([] {}));
-    release_task.set_value();
+    release_on_exit.signal();
     pool.join();
     assert(queued_done.wait_for(std::chrono::seconds(2)) == std::future_status::ready);
 }
@@ -41,7 +56,10 @@ void pool_survives_task_exceptions() {
     assert(result.wait_for(std::chrono::seconds(2)) == std::future_status::ready);
 }
 
-int main() {
-    pool_bounds_queue_and_drains_accepted_tasks();
-    pool_survives_task_exceptions();
+int main(int argc, char* argv[]) {
+    TestRunner runner(argc, argv);
+    runner.run("pool_bounds_queue_and_drains_accepted_tasks",
+               pool_bounds_queue_and_drains_accepted_tasks);
+    runner.run("pool_survives_task_exceptions", pool_survives_task_exceptions);
+    return runner.finish();
 }

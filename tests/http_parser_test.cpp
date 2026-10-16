@@ -2,6 +2,7 @@
 
 #include <cassert>
 #include <string>
+#include "test_runner.h"
 
 void parses_fragmented_headers_and_body() {
     HTTPParser parser;
@@ -22,6 +23,14 @@ void parses_request_without_body() {
     assert(parser.feed("GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n") ==
            ParseStatus::Complete);
     assert(parser.request().body.empty());
+}
+
+void separates_query_from_request_path() {
+    HTTPParser parser;
+    assert(parser.feed("GET /recent?count=12 HTTP/1.1\r\nHost: localhost\r\n\r\n") ==
+           ParseStatus::Complete);
+    assert(parser.request().path == "/recent");
+    assert(parser.request().query == "count=12");
 }
 
 void rejects_malformed_and_unsupported_requests() {
@@ -47,10 +56,13 @@ void enforces_limits() {
     assert(headers.feed("GET /a-very-long-path HTTP/1.1\r\n") == ParseStatus::Error);
 }
 
-int main() {
-    parses_fragmented_headers_and_body();
-    parses_request_without_body();
-    rejects_malformed_and_unsupported_requests();
-    enforces_limits();
-    return 0;
+int main(int argc, char* argv[]) {
+    TestRunner runner(argc, argv);
+    runner.run("parses_fragmented_headers_and_body", parses_fragmented_headers_and_body);
+    runner.run("parses_request_without_body", parses_request_without_body);
+    runner.run("separates_query_from_request_path", separates_query_from_request_path);
+    runner.run("rejects_malformed_and_unsupported_requests",
+               rejects_malformed_and_unsupported_requests);
+    runner.run("enforces_limits", enforces_limits);
+    return runner.finish();
 }

@@ -12,6 +12,8 @@ The current implementation is an event-driven TCP server using C++17,
 non-blocking IPv4 sockets, Linux `epoll`, multiple `SO_REUSEPORT` connection
 workers, a bounded shared request pool, per-connection state, incremental HTTP
 parsing, response serialization, and exact method/path routing.
+It also includes a segmented mmap-backed append-only log, restart recovery, a
+recent-message circular cache, and log-size metrics.
 
 ### In simple terms
 
@@ -31,10 +33,13 @@ The project has been built in layers:
 6. Exact method/path routing and observability endpoints.
 7. Central runtime configuration, pooled request handling, concurrent rate
   limiting, and graceful task draining.
+8. Versioned segmented mmap storage, restart recovery, and a recovered recent
+  message cache.
 
-The networking and HTTP transport layers are implemented. Telemetry business
-logic is not complete: the HTTP body is assembled as text, but JSON validation,
-storage, and downstream delivery still need to be added.
+The networking, HTTP transport, and persistent-log layers are implemented.
+Telemetry business logic is not complete: HTTP request bodies are still opaque
+strings, and there is no validated producer route that appends telemetry or
+delivers it downstream.
 
 ### Technical view
 
@@ -93,11 +98,12 @@ cmake --build build
 
 The sample config sets port `8080`, backlog `128`, automatic epoll worker count,
 four request-pool threads, a queue capacity of 1024, and rate-limit defaults.
-CLI flags override config-file values. For example:
+It also sets `data/log` as the storage directory, 64 MiB segment files, and a
+1024-message recent cache. CLI flags override config-file values. For example:
 
 ```bash
 ./build/message_gateway --config config.example.ini --port 9000 \
-  --epoll-workers 2 --pool-threads 8
+  --epoll-workers 2 --pool-threads 8 --storage-directory /var/lib/gateway/log
 ```
 
 The server accepts `SIGINT` or `SIGTERM` and drains accepted request tasks
@@ -114,7 +120,8 @@ with at least one worker.
 
 The first commands compile the program. The last command starts it. Config
 values and CLI overrides choose listener settings, epoll workers, pool size,
-queue capacity, log destination, and per-IP rate-limit policy.
+queue capacity, log destination, per-IP rate-limit policy, segment size, and
+recent-cache capacity.
 
 ## 5. Startup and Worker Architecture
 
@@ -261,7 +268,8 @@ The executable currently registers:
 - `GET /connections` -> the aggregate active connection count as JSON.
 - `GET /metrics` -> Prometheus text metrics for connections, requests,
   rejections, parser errors, request duration, uptime, and pool worker count,
-  busy thread count, and queue length.
+  busy thread count, queue length, and log segment-file bytes.
+- `GET /recent` -> recent messages from the in-memory cache, serialized as JSON.
 
 The active count is atomic because each worker owns a separate connection map.
 
@@ -327,7 +335,36 @@ short burst, but new tickets slowly appear over time. If the cup is empty, the
 gateway says “try later” instead of doing the requested work. A noisy device
 does not use up everyone else's tickets.
 
-## 12. Testing and Verification
+## 12. Persistent Storage and Recent Messages
+
+`MemoryMappedLog` writes fixed-width little-endian records into preallocated
+segment files under the configured storage directory. Each record carries a
+global byte offset, timestamp, payload length, and CRC-32/IEEE checksum. The
+segment and record headers have explicit versions and fixed field widths; no
+native C++ struct layout is persisted. On startup, the log scans segments and
+restores the last valid offset. It treats a zero record magic as padding only
+when the entire remaining tail is zero, so payload bytes left before a torn
+header are detected. An incomplete or corrupt tail in the newest segment is
+truncated to the last complete record; corruption in a sealed older segment
+fails startup. Records are kept within one segment, with rollover before a
+record would cross its boundary.
+
+An in-memory circular cache is rebuilt from recovered records and updated on
+append. Cache access is synchronized by the log; the standalone circular buffer
+is not thread-safe and requires a default-constructible, copyable value type.
+`GET /recent` reads only this cache and accepts `?count=N` (default 100,
+maximum 1000); malformed, unknown, repeated, or excessive count parameters
+return `400 Bad Request`. Returned messages are ordered oldest-to-newest within
+the selected recent set. `gateway_log_disk_bytes` reports the sum of segment
+file lengths, which is provisioned capacity rather than only bytes containing
+valid messages. Appends are visible immediately but are not guaranteed durable
+until `flush()` or successful close/rollover synchronization. Explicit flush
+and close calls propagate persistence errors; destructor cleanup reports a
+failure to standard error because destructors cannot throw. The storage API is
+ready for the future publish handler, but this change does not introduce
+`POST /publish`.
+
+## 13. Testing and Verification
 
 The repository includes CMake/CTest parser unit tests in
 `tests/http_parser_test.cpp`. They cover fragmented headers and bodies,
@@ -395,33 +432,46 @@ The small tests check individual rules, the HTTP suite checks the real server
 with realistic broken and slow clients, and the 50,000-client test checks how
 many connections the network foundation can keep alive.
 
-## 13. Implemented, Planned, and Limited
+## 14. Implemented, Planned, and Limited
 
 ### Implemented
 
 - CMake/C++17 build with strict compiler warnings.
-- Docker raw-socket HTTP integration tests with 10 passing cases.
-- Per-IP token-bucket rate limiting with a mutex-protected shared limiter.
+- Configurable runtime settings, thread pool, graceful task drain, and pool metrics.
+- Per-IP rate limiting with a shared map lock and per-bucket synchronization.
+- Segmented mmap-backed storage with checksummed records, global offsets, and
+  restart recovery that detects torn payload-before-header writes and rejects
+  corruption in sealed segments.
+- A recovered recent-message cache exposed through `GET /recent`.
+- Provisioned segment-file capacity exposed in `/metrics` as
+  `gateway_log_disk_bytes`.
+- C++ tests for configuration, pool behavior, rate limiting, storage recovery,
+  rollover boundaries, oversized records, cache ordering, JSON escaping,
+  metrics, and shutdown drain.
 
 ### Planned next
 
-- Register and implement `POST /publish`.
+- Implement `POST /publish`.
 - Parse and validate telemetry JSON and field ranges.
-- Persist or forward accepted telemetry.
+- Persist or forward validated telemetry through the new log API.
 - Implement the Week 9 binary consumer protocol.
 - Add authentication and broader spam/DDoS protection.
 - Add downstream backpressure and failure-recovery tests.
-- Add production-level metrics and observability.
+- Run the updated Docker HTTP suite and pooled-server load tests.
 
 ### Current limitations
 
 - Telemetry JSON is not yet validated by an application handler.
 - There is no authentication or authorization.
-- There is no persistent buffering or downstream broadcasting.
+- The storage API exists, but no application telemetry route currently writes
+  producer requests into it.
+- `gateway_log_disk_bytes` measures preallocated segment capacity, not only
+  bytes containing valid records.
 - Keep-alive and pipelining are not implemented; connections close after one response.
 - Chunked transfer encoding is rejected.
 - The queue limit is a fixed safe default, not workload-specific tuning.
-- The Docker load test has not yet been converted from raw echo to HTTP.
+- The Docker load test remains a raw TCP connection-retention test; the updated
+  pooled HTTP integration suite has not yet been recorded as run.
 - Inactive IP buckets are not yet expired, so the limiter map needs bounded
   cleanup before hostile high-cardinality traffic is considered production-safe.
 
@@ -430,15 +480,15 @@ many connections the network foundation can keep alive.
 **Technical answer:** The project establishes a thread-confined, event-driven
 TCP foundation and adds a bounded incremental HTTP transport layer. It has
 clear ownership boundaries between sockets, parsing, routing, and future
-telemetry processing. The main remaining work is application-level telemetry
-validation, storage/forwarding, consumer streaming, and production controls.
+telemetry processing. The durable log and recent cache are implemented; the
+main remaining work is connecting validated producer telemetry to that storage,
+consumer streaming, and production controls.
 
 **Simple answer:** We first made sure the server can handle many connections
-reliably. Then we taught it how to understand HTTP safely. Next we need to
-teach it what telemetry means, where to store it, and how to stream it to the
-future consumers.
+reliably, understand HTTP safely, and retain records on disk. Next we need to
+validate incoming telemetry and connect it to storage and future consumers.
 
-## 14. Keeping This Document Updated
+## 15. Keeping This Document Updated
 
 Update this document when a change affects the architecture, a design decision,
 the implemented feature list, planned work, or current limitations. Each
