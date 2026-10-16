@@ -20,6 +20,7 @@ to debug a reliable TCP foundation before adding parsing and application logic.
 The gateway is a CMake-based C++17 executable built with `-Wall`, `-Wextra`,
 and `-Wpedantic`. `Config` centralizes the listening port, backlog, epoll worker
 count, request-pool size and queue capacity, log path, and rate-limit policy.
+It also centralizes the log directory, segment size, and recent-cache capacity.
 Values load from a simple `key=value` file, and CLI options override file
 values. Configuration is validated before server startup; `config.example.ini`
 shows the supported settings.
@@ -68,6 +69,66 @@ its outstanding tasks and connections are gone; the server then joins the
 epoll threads and pool workers. Hard listener errors trigger the same drain
 path, while client errors remove the descriptor and close the connection.
 
+### 2.7 Persistent segmented log and recent cache
+
+`MemoryMappedLog` stores append-only segment files in the configured
+`storage_directory`. The default segment capacity is 64 MiB. Files are named
+`log-00000001.seg`, `log-00000002.seg`, and so on, and are pre-sized with
+`ftruncate()` before being mapped `MAP_SHARED` with read/write protection.
+Records never cross segment boundaries; a new segment is created before an
+append that will not fit.
+
+The on-disk representation is explicitly serialized little-endian; it does not
+write native C++ structs:
+
+```text
+40-byte segment header:
+  magic[8] | version:u32 | segment_id:u32 | base_offset:u64
+  segment_capacity:u64 | header_crc32:u32 | reserved:u32
+
+32-byte record header, followed by payload bytes:
+  record_magic:u32 | header_size:u32 | message_offset:u64
+  timestamp_ns:u64 | payload_length:u32 | crc32:u32 | payload[payload_length]
+```
+
+The CRC covers the first 28 record-header bytes and the payload. Message
+offsets start at zero and advance by each serialized record's header plus
+payload size; segment headers are not part of the logical offset space. Each
+segment index entry records its ID, path, first/end message offsets, and valid
+physical byte boundary for later offset seeking. Payload bytes are copied
+before the record header. The segment-header CRC covers its first 32 bytes;
+the record CRC is CRC-32/IEEE over the first 28 record-header bytes followed by
+the payload. Both CRC values are stored little-endian.
+
+Startup scans segments in ID order, validates segment headers and each record's
+offset, bounds, and checksum, rebuilds the recent-message cache, and resumes at
+the last valid record. A zero record magic is considered unused padding only
+when every remaining byte in the segment is zero. This detects payload bytes
+left behind if a crash occurs after payload copy but before header copy. Any
+invalid or incomplete tail in the newest segment is truncated to the preceding
+valid boundary; corruption in a sealed older segment fails startup rather than
+silently discarding history. `flush()` and normal close/rollover call
+`msync(MS_SYNC)` and `fsync()`, and report persistence errors. Appends are
+serialized with the log mutex. An append is visible through the mapping and
+recent cache immediately, but is not guaranteed durable until `flush()` or
+normal close/rollover completes successfully; an unflushed append may be lost
+on power failure. Explicit `flush()` and `close()` propagate failures to the
+caller. The destructor also attempts a synchronized close, but reports a
+failure to standard error because it cannot throw during destruction.
+
+The configurable circular buffer retains the latest messages in RAM and is
+rebuilt from the log on restart. Its `T` type must be default-constructible
+(backing vector slots) and copyable (`get_recent()` returns copied values).
+`CircularBuffer` itself is not thread-safe; `MemoryMappedLog` synchronizes
+append and cache reads with its mutex. `GET /recent` serializes that cache
+without scanning disk per request. It accepts an optional `count` query
+parameter, defaults to 100, permits values from 0 through 1000, and returns
+`400 Bad Request` for malformed, repeated, unknown, or over-limit query values.
+The returned set is chronological, oldest-to-newest. The persistent log exposes
+an append API for the future publish path; `POST /publish` is not added in this
+step. The `gateway_log_disk_bytes` metric sums segment file lengths and
+represents provisioned segment capacity, not only valid record bytes.
+
 ## 3. Load Testing and Container Support
 
 The project includes a Docker build and a connection-ramp test setup.
@@ -97,6 +158,7 @@ The current protocol layer adds these types:
 struct HttpRequest {
     std::string method;
     std::string path;
+  std::string query;
     std::unordered_map<std::string, std::string> headers;
     std::string body;
 };
@@ -192,7 +254,10 @@ The executable currently registers these endpoints:
   `gateway_http_responses_total` grouped by status class,
   `gateway_http_request_duration_seconds`, `process_uptime_seconds`,
   `gateway_thread_pool_workers`, `gateway_thread_pool_busy_threads`, and
-  `gateway_thread_pool_queue_length`.
+  `gateway_thread_pool_queue_length`, and `gateway_log_disk_bytes`. The latter
+  is a gauge of provisioned segment-file bytes because segments are pre-sized.
+- `GET /recent` returns the configured number of newest messages from the
+  in-memory circular cache as JSON.
 - `GET /large-response` returns a deterministic 512 KiB body for transport
   tests of slow readers and partial writes.
 
@@ -265,6 +330,7 @@ The suite covers:
 - Connection closure after one response.
 - 100 concurrent raw-socket HTTP clients.
 - A slow reader consuming a 512 KiB response in small chunks.
+- `/recent` empty-cache JSON and query validation, plus `/metrics` exposition.
 
 The last case uses `GET /large-response`, a deterministic transport-test
 endpoint that returns 512 KiB of `x` bytes. The client limits its receive
@@ -286,7 +352,9 @@ slow-reader integration         -> partial writes and EPOLLOUT backpressure
 Focused C++ tests also cover config-file/CLI precedence, pool queue capacity and
 drain semantics, exception survival, concurrent same-IP rate limiting, and a
 blocked handler completing during the server's SIGTERM shutdown path. Run the
-compiled test suite with:
+compiled test suite with the command below. Each test function is registered
+as an individual CTest case, so CTest reports its name and pass/fail status
+separately rather than reporting only one result per test executable:
 
 ```bash
 cmake -S . -B build
@@ -295,7 +363,23 @@ ctest --test-dir build --output-on-failure
 ```
 
 The HTTP integration metrics check verifies `gateway_thread_pool_workers`,
-`gateway_thread_pool_busy_threads`, and `gateway_thread_pool_queue_length`.
+`gateway_thread_pool_busy_threads`, `gateway_thread_pool_queue_length`, and
+`gateway_log_disk_bytes`; it also checks that an empty cache produces `[]` at
+`GET /recent`, as well as query validation for zero, malformed, unknown,
+repeated, and over-limit values.
+
+`mmap_log_tests` verifies restart persistence, variable and empty payloads,
+segment rollover and global offsets, exact-fit rollover, oversized-record
+rejection, incomplete-header and incomplete-payload recovery, payload bytes
+written before a missing header, active-tail checksum rejection, and fatal
+corruption in a sealed segment. `circular_buffer_tests` verifies chronological
+ordering below capacity, exactly at capacity, after wraparound, zero and
+oversized reads, and capacity one. `http_parser_tests` verifies that a query
+string is separated from the route path. `tcp_server_drain_tests` seeds messages
+through the server API and checks default ordering, a limited count, zero count,
+invalid and over-limit counts, JSON escaping, response content type, configured
+segment-size metrics, and graceful response draining. `metrics_tests` checks
+that the disk gauge's help text describes provisioned bytes.
 
 The suite intentionally does not test telemetry JSON validation yet because
 `POST /publish` has not been implemented. Once that handler exists, the same
@@ -341,7 +425,8 @@ The implementation favors a small number of clear ownership boundaries:
 - HTTP framing belongs to `HTTPParser`.
 - HTTP formatting belongs to `HttpResponse`.
 - Application dispatch belongs to `Router` and route handlers.
-- Telemetry validation and persistence belong to the future application layer.
+- Telemetry validation and publish-route integration belong to the future
+  application layer; the durable log API is now implemented.
 
 This structure was chosen for four reasons:
 
@@ -387,6 +472,9 @@ Implemented today:
   and handler bypass on `429 Too Many Requests`.
 - Config, pool saturation/drain, concurrent limiter, and server shutdown tests.
 - Pool worker, busy-thread, and queue-length metrics.
+- Segmented mmap log with CRC-checked records, offset tracking, and startup recovery.
+- Recent-message cache and `GET /recent`; log capacity gauge in `/metrics`.
+- Storage recovery, rollover, circular-cache, and recent-route test coverage.
 - A deterministic large-response endpoint for testing partial response writes.
 - Telemetry event documentation.
 
@@ -394,7 +482,7 @@ Still to implement:
 
 - Register the `POST /publish` handler.
 - Validate telemetry JSON and its field ranges.
-- Persist or forward accepted telemetry.
+- Connect validated `POST /publish` messages to persistent append and downstream delivery.
 - Add authentication, rate limiting, and spam/DDoS protection.
 - Add keep-alive or pipelining if required.
 - Add chunked transfer encoding if required.

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <string>
 
 struct Config {
@@ -12,6 +13,9 @@ struct Config {
     std::string log_path;
     double rate_limit_capacity = 10.0;
     double rate_limit_refill_rate = 5.0;
+    std::string storage_directory = "data/log";
+    std::uint64_t storage_segment_size = 64ULL * 1024ULL * 1024ULL;
+    std::size_t recent_message_capacity = 1024;
 
     static Config from_args(int argc, char* argv[]);
     static Config load_file(const std::string& path);

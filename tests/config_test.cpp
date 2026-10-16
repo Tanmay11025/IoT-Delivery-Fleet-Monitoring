@@ -6,12 +6,14 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include "test_runner.h"
 
 void config_reads_file_and_cli_overrides() {
     const std::string path = "/tmp/gateway-config-test.conf";
     {
         std::ofstream file(path);
-        file << "port=9001\nthread_pool_size=3\nrate_limit_capacity=8\n";
+        file << "port=9001\nthread_pool_size=3\nrate_limit_capacity=8\n"
+            "storage_directory=temporary-log\nstorage_segment_size=4096\n";
     }
     std::vector<std::string> arguments{
         "gateway", "--config", path, "--port", "9002", "--pool-threads", "5"};
@@ -22,6 +24,8 @@ void config_reads_file_and_cli_overrides() {
     assert(config.port == 9002);
     assert(config.thread_pool_size == 5);
     assert(config.rate_limit_capacity == 8.0);
+    assert(config.storage_directory == "temporary-log");
+    assert(config.storage_segment_size == 4096);
     std::remove(path.c_str());
 }
 
@@ -51,7 +55,10 @@ void config_rejects_invalid_values_and_unknown_keys() {
     assert(unknown_key_rejected);
 }
 
-int main() {
-    config_reads_file_and_cli_overrides();
-    config_rejects_invalid_values_and_unknown_keys();
+int main(int argc, char* argv[]) {
+    TestRunner runner(argc, argv);
+    runner.run("config_reads_file_and_cli_overrides", config_reads_file_and_cli_overrides);
+    runner.run("config_rejects_invalid_values_and_unknown_keys",
+               config_rejects_invalid_values_and_unknown_keys);
+    return runner.finish();
 }

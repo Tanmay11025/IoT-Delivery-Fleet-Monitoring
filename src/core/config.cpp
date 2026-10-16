@@ -36,6 +36,9 @@ void apply(Config& config, const std::string& key, const std::string& value) {
     else if (key == "log_path") config.log_path = value;
     else if (key == "rate_limit_capacity") config.rate_limit_capacity = parse_number<double>(value, key);
     else if (key == "rate_limit_refill_rate") config.rate_limit_refill_rate = parse_number<double>(value, key);
+    else if (key == "storage_directory") config.storage_directory = value;
+    else if (key == "storage_segment_size") config.storage_segment_size = parse_number<std::uint64_t>(value, key);
+    else if (key == "recent_message_capacity") config.recent_message_capacity = parse_number<std::size_t>(value, key);
     else throw std::runtime_error("Unknown configuration key: " + key);
 }
 
@@ -48,6 +51,9 @@ const std::unordered_map<std::string, std::string> options{
     {"--log-path", "log_path"},
     {"--rate-limit-capacity", "rate_limit_capacity"},
     {"--rate-limit-refill-rate", "rate_limit_refill_rate"},
+    {"--storage-directory", "storage_directory"},
+    {"--storage-segment-size", "storage_segment_size"},
+    {"--recent-capacity", "recent_message_capacity"},
 };
 }
 
@@ -126,5 +132,12 @@ void Config::validate() const {
     }
     if (!std::isfinite(rate_limit_refill_rate) || rate_limit_refill_rate < 0.0) {
         throw std::runtime_error("rate_limit_refill_rate must be finite and non-negative");
+    }
+    if (storage_directory.empty()) throw std::runtime_error("storage_directory must not be empty");
+    if (storage_segment_size < 73 || storage_segment_size > 1024ULL * 1024ULL * 1024ULL) {
+        throw std::runtime_error("storage_segment_size must be between 73 bytes and 1 GiB");
+    }
+    if (recent_message_capacity == 0 || recent_message_capacity > (1U << 20)) {
+        throw std::runtime_error("recent_message_capacity must be between 1 and 1048576");
     }
 }

@@ -24,7 +24,8 @@ public:
     std::size_t active_connections() const;
     std::string prometheus_text(std::size_t pool_workers = 0,
                                 std::size_t busy_threads = 0,
-                                std::size_t queue_length = 0) const;
+                                std::size_t queue_length = 0,
+                                std::uint64_t log_disk_bytes = 0) const;
 
 private:
     static constexpr std::array<double, 11> duration_buckets{

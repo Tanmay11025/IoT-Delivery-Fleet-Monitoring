@@ -81,7 +81,15 @@ ParseStatus HTTPParser::parse_headers(size_t header_end) {
     }
 
     parsed_request.method.assign(request_line.substr(0, method_end));
-    parsed_request.path.assign(request_line.substr(method_end + 1, path_end - method_end - 1));
+    const string_view target = request_line.substr(method_end + 1,
+                                                    path_end - method_end - 1);
+    const size_t query_start = target.find('?');
+    const string_view path = target.substr(0, query_start);
+    if (path.empty()) return fail("request target path is empty");
+    parsed_request.path.assign(path);
+    if (query_start != string_view::npos) {
+        parsed_request.query.assign(target.substr(query_start + 1));
+    }
 
     // Read each header line and save it.
     size_t line_start = request_line_end + 2;

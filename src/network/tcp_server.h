@@ -29,6 +29,7 @@
 #include "epoll_loop.h"
 #include "../monitoring/metrics.h"
 #include "thread_pool.h"
+#include "../storage/mmap_log.h"
 
 using namespace std;
 
@@ -73,7 +74,13 @@ public:
     string metrics_text() const {
         const auto stats = thread_pool ? thread_pool->stats() : ThreadPool::Stats{0, 0, 0};
         return metrics.prometheus_text(stats.worker_count, stats.busy_threads,
-                                       stats.queue_length);
+                                       stats.queue_length, storage_log.disk_usage_bytes());
+    }
+
+    std::string recent_messages_json(std::size_t count = 100) const;
+    HttpResponse recent_messages_response(const HttpRequest& request) const;
+    std::uint64_t append_message(const std::string& payload) {
+        return storage_log.append(payload);
     }
 
     void add_route(string method, string path, Router::Handler handler) {
@@ -133,5 +140,6 @@ private:
     Metrics metrics;
     vector<thread> workers;
     unique_ptr<ThreadPool> thread_pool;
+    MemoryMappedLog storage_log;
     Router router;
 };

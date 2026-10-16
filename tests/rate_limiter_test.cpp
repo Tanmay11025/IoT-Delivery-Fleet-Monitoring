@@ -6,6 +6,7 @@
 #include <atomic>
 #include <thread>
 #include <vector>
+#include "test_runner.h"
 
 void token_bucket_allows_burst_and_refills() {
     using Clock = std::chrono::steady_clock;
@@ -56,7 +57,7 @@ void router_rejects_before_handler_dispatch() {
         return HttpResponse{200, "OK", {}, "ok"};
     });
 
-    const HttpRequest request{"GET", "/health", {}, {}};
+    const HttpRequest request{"GET", "/health", {}, {}, {}};
     for (int attempt = 0; attempt < 10; ++attempt) {
         assert(router.route(request, "192.0.2.10").status_code == 200);
     }
@@ -85,12 +86,15 @@ void rate_limiter_serializes_concurrent_consumption_per_ip() {
     assert(allowed.load() == 20);
 }
 
-int main() {
-    token_bucket_allows_burst_and_refills();
-    token_bucket_caps_refill_at_capacity();
-    token_bucket_does_not_refill_without_elapsed_time();
-    rate_limiter_tracks_ips_independently();
-    router_rejects_before_handler_dispatch();
-    rate_limiter_serializes_concurrent_consumption_per_ip();
-    return 0;
+int main(int argc, char* argv[]) {
+    TestRunner runner(argc, argv);
+    runner.run("token_bucket_allows_burst_and_refills", token_bucket_allows_burst_and_refills);
+    runner.run("token_bucket_caps_refill_at_capacity", token_bucket_caps_refill_at_capacity);
+    runner.run("token_bucket_does_not_refill_without_elapsed_time",
+               token_bucket_does_not_refill_without_elapsed_time);
+    runner.run("rate_limiter_tracks_ips_independently", rate_limiter_tracks_ips_independently);
+    runner.run("router_rejects_before_handler_dispatch", router_rejects_before_handler_dispatch);
+    runner.run("rate_limiter_serializes_concurrent_consumption_per_ip",
+               rate_limiter_serializes_concurrent_consumption_per_ip);
+    return runner.finish();
 }

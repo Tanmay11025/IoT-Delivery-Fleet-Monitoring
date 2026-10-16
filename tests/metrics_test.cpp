@@ -3,6 +3,7 @@
 #include <cassert>
 #include <chrono>
 #include <string>
+#include "test_runner.h"
 
 void metrics_track_connection_lifecycle() {
     Metrics metrics;
@@ -50,15 +51,21 @@ void metrics_track_requests_responses_and_duration() {
 void metrics_track_parse_errors_and_uptime() {
     Metrics metrics;
     metrics.parse_error();
-    const std::string exposition = metrics.prometheus_text();
+       const std::string exposition = metrics.prometheus_text(4, 1, 2, 4096);
 
     assert(exposition.find("gateway_http_parse_errors_total 1\n") != std::string::npos);
     assert(exposition.find("process_uptime_seconds ") != std::string::npos);
+       assert(exposition.find("gateway_log_disk_bytes 4096\n") != std::string::npos);
+       assert(exposition.find(
+                  "# HELP gateway_log_disk_bytes Provisioned bytes across pre-sized log segment files.\n") !=
+              std::string::npos);
 }
 
-int main() {
-    metrics_track_connection_lifecycle();
-    metrics_track_requests_responses_and_duration();
-    metrics_track_parse_errors_and_uptime();
-    return 0;
+int main(int argc, char* argv[]) {
+       TestRunner runner(argc, argv);
+       runner.run("metrics_track_connection_lifecycle", metrics_track_connection_lifecycle);
+       runner.run("metrics_track_requests_responses_and_duration",
+                        metrics_track_requests_responses_and_duration);
+       runner.run("metrics_track_parse_errors_and_uptime", metrics_track_parse_errors_and_uptime);
+       return runner.finish();
 }

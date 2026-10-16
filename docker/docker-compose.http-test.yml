@@ -6,7 +6,8 @@ services:
     command:
       ["./build/message_gateway", "--port", "8080", "--backlog", "128",
        "--epoll-workers", "1", "--pool-threads", "4",
-       "--rate-limit-capacity", "1000", "--rate-limit-refill-rate", "0"]
+      "--rate-limit-capacity", "1000", "--rate-limit-refill-rate", "0",
+      "--storage-directory", "/tmp/gateway-http-test-storage"]
     ulimits:
       nofile:
         soft: 200000

@@ -209,6 +209,7 @@ def test_metrics_endpoint():
         "gateway_thread_pool_workers",
         "gateway_thread_pool_busy_threads",
         "gateway_thread_pool_queue_length",
+        "gateway_log_disk_bytes",
     ]
     assert all(sample in first for sample in required_samples)
     assert first["gateway_connections_active"] >= 1
@@ -219,6 +220,7 @@ def test_metrics_endpoint():
     assert first["gateway_thread_pool_workers"] == 4
     assert 0 <= first["gateway_thread_pool_busy_threads"] <= 4
     assert first["gateway_thread_pool_queue_length"] >= 0
+    assert first["gateway_log_disk_bytes"] >= 1
 
     status, _, second_body = send_request(request)
     assert status == "HTTP/1.1 200 OK"
@@ -227,6 +229,31 @@ def test_metrics_endpoint():
     assert second["gateway_http_request_duration_seconds_count"] == first[
         "gateway_http_requests_total"
     ]
+
+
+def test_recent_endpoint():
+    status, headers, body = send_request(
+        b"GET /recent HTTP/1.1\r\nHost: gateway\r\n\r\n"
+    )
+    assert status == "HTTP/1.1 200 OK"
+    assert headers["content-type"] == "application/json"
+    assert body == b"[]"
+
+    status, _, body = send_request(
+        b"GET /recent?count=0 HTTP/1.1\r\nHost: gateway\r\n\r\n"
+    )
+    assert status == "HTTP/1.1 200 OK"
+    assert body == b"[]"
+
+    invalid_queries = [
+        b"GET /recent?count=nope HTTP/1.1\r\nHost: gateway\r\n\r\n",
+        b"GET /recent?count=1001 HTTP/1.1\r\nHost: gateway\r\n\r\n",
+        b"GET /recent?other=1 HTTP/1.1\r\nHost: gateway\r\n\r\n",
+        b"GET /recent?count=1&count=2 HTTP/1.1\r\nHost: gateway\r\n\r\n",
+    ]
+    for request in invalid_queries:
+        status, _, _ = send_request(request)
+        assert status == "HTTP/1.1 400 Bad Request", status
 
 
 def test_concurrent_clients():
@@ -278,6 +305,7 @@ def main():
         test_routing,
         test_concurrent_clients,
         test_slow_reader_partial_response,
+        test_recent_endpoint,
         test_metrics_endpoint,
     ]
     for test in tests:

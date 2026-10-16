@@ -1,7 +1,34 @@
 #include "tcp_server.h"
 
+#include <charconv>
 #include <sys/eventfd.h>
 
+namespace {
+std::string json_escape(const std::string& value) {
+    static constexpr char hex[] = "0123456789abcdef";
+    std::string escaped;
+    for (const unsigned char byte : value) {
+        switch (byte) {
+        case '"': escaped += "\\\""; break;
+        case '\\': escaped += "\\\\"; break;
+        case '\b': escaped += "\\b"; break;
+        case '\f': escaped += "\\f"; break;
+        case '\n': escaped += "\\n"; break;
+        case '\r': escaped += "\\r"; break;
+        case '\t': escaped += "\\t"; break;
+        default:
+            if (byte < 0x20) {
+                escaped += "\\u00";
+                escaped += hex[byte >> 4];
+                escaped += hex[byte & 0x0f];
+            } else {
+                escaped += static_cast<char>(byte);
+            }
+        }
+    }
+    return escaped;
+}
+}
 
 
 // Signal handlers do no I/O or locking: they only update this shared flag.
@@ -102,6 +129,13 @@ bool TCPServer::start() {
     shutdown_requested.store(false, memory_order_relaxed);
     worker_failed.store(false, memory_order_relaxed);
     try {
+        storage_log.open(config.storage_directory, config.storage_segment_size,
+                         config.recent_message_capacity);
+    } catch (const exception& exception) {
+        cerr << "Unable to open persistent log: " << exception.what() << '\n';
+        return false;
+    }
+    try {
         thread_pool = make_unique<ThreadPool>(config.thread_pool_size,
                                               config.task_queue_capacity);
     } catch (const exception& exception) {
@@ -130,6 +164,47 @@ bool TCPServer::start() {
     thread_pool->join();
 
     return !worker_failed.load(memory_order_relaxed);
+}
+
+std::string TCPServer::recent_messages_json(std::size_t count) const {
+    const auto messages = storage_log.get_recent(count);
+    std::string json = "[";
+    bool first = true;
+    for (const auto& message : messages) {
+        if (!first) json += ',';
+        first = false;
+        json += "{\"offset\":" + std::to_string(message.offset) +
+                ",\"timestamp_ns\":" + std::to_string(message.timestamp_ns) +
+                ",\"payload_length\":" + std::to_string(message.payload_length) +
+                ",\"payload\":\"" + json_escape(message.payload) + "\"}";
+    }
+    json += ']';
+    return json;
+}
+
+HttpResponse TCPServer::recent_messages_response(const HttpRequest& request) const {
+    constexpr std::size_t default_count = 100;
+    constexpr std::size_t maximum_count = 1000;
+    std::size_t count = default_count;
+
+    if (!request.query.empty()) {
+        const std::string_view query(request.query);
+        if (query.compare(0, 6, "count=") != 0 || query.find('&') != std::string_view::npos) {
+            return HttpResponse{400, "Bad Request", {}, "Invalid recent count query"};
+        }
+        const std::string_view value = query.substr(6);
+        if (value.empty()) {
+            return HttpResponse{400, "Bad Request", {}, "Invalid recent count query"};
+        }
+        const auto result = std::from_chars(value.data(), value.data() + value.size(), count);
+        if (result.ec != std::errc{} || result.ptr != value.data() + value.size() ||
+            count > maximum_count) {
+            return HttpResponse{400, "Bad Request", {}, "Invalid recent count query"};
+        }
+    }
+
+    return HttpResponse{200, "OK", {{"Content-Type", "application/json"}},
+                        recent_messages_json(count)};
 }
 
 void TCPServer::worker_loop(unsigned int worker_id) {
