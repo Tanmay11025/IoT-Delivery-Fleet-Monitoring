@@ -9,9 +9,9 @@ validate it, preserve it, and make it available to downstream consumers.
 ### Technical view
 
 The current implementation is an event-driven TCP server using C++17,
-non-blocking IPv4 sockets, Linux `epoll`, multiple `SO_REUSEPORT` workers,
-per-connection state, bounded output queues, incremental HTTP parsing, HTTP
-response serialization, and exact method/path routing.
+non-blocking IPv4 sockets, Linux `epoll`, multiple `SO_REUSEPORT` connection
+workers, a bounded shared request pool, per-connection state, incremental HTTP
+parsing, response serialization, and exact method/path routing.
 
 ### In simple terms
 
@@ -29,6 +29,8 @@ The project has been built in layers:
 4. Graceful shutdown, logging, and Docker-based connection testing.
 5. Incremental HTTP request parsing and HTTP response serialization.
 6. Exact method/path routing and observability endpoints.
+7. Central runtime configuration, pooled request handling, concurrent rate
+  limiting, and graceful task draining.
 
 The networking and HTTP transport layers are implemented. Telemetry business
 logic is not complete: the HTTP body is assembled as text, but JSON validation,
@@ -86,44 +88,50 @@ From the repository root:
 ```bash
 cmake -S . -B build
 cmake --build build
-./build/message_gateway [port] [backlog] [workers]
+./build/message_gateway --config config.example.ini --pool-threads 8
 ```
 
-Defaults are port `8080`, backlog `128`, and one worker per detected hardware
-thread. For example:
+The sample config sets port `8080`, backlog `128`, automatic epoll worker count,
+four request-pool threads, a queue capacity of 1024, and rate-limit defaults.
+CLI flags override config-file values. For example:
 
 ```bash
-./build/message_gateway 9000 256 2
+./build/message_gateway --config config.example.ini --port 9000 \
+  --epoll-workers 2 --pool-threads 8
 ```
 
-The server stops cleanly when it receives `Ctrl+C`.
+The server accepts `SIGINT` or `SIGTERM` and drains accepted request tasks
+before joining its threads.
 
 ### Technical view
 
-`main.cpp` validates the optional numeric arguments, registers routes, creates
-`TCPServer`, and starts the worker threads. A worker-count value of `0` selects
-the hardware-concurrency count, with at least one worker.
+`main.cpp` loads and validates a `Config` from a simple `key=value` file and
+then applies CLI overrides. The epoll-worker count and request-pool size are
+separate settings. An epoll-worker count of `0` selects hardware concurrency,
+with at least one worker.
 
 ### In simple terms
 
-The first commands compile the program. The last command starts it. The three
-optional numbers choose the listening port, how many connections can wait in
-the kernel backlog, and how many server teams should run.
+The first commands compile the program. The last command starts it. Config
+values and CLI overrides choose listener settings, epoll workers, pool size,
+queue capacity, log destination, and per-IP rate-limit policy.
 
 ## 5. Startup and Worker Architecture
 
 The startup path is:
 
 1. Parse and validate command-line arguments.
-2. Start the configured number of worker threads.
-3. Each worker creates an IPv4 TCP listener.
-4. Enable `SO_REUSEADDR` and `SO_REUSEPORT`.
-5. Bind, listen, and set the listener to non-blocking mode.
-6. Register the listener with that worker's `EpollLoop`.
+2. Start the fixed-size request pool.
+3. Start the configured epoll workers.
+4. Each epoll worker creates an IPv4 TCP listener.
+5. Enable `SO_REUSEADDR` and `SO_REUSEPORT`.
+6. Bind, listen, and set the listener to non-blocking mode.
+7. Register the listener and completion `eventfd` with that worker's `EpollLoop`.
 
-Each worker owns one listener, one event loop, and one `ConnectionManager`.
-Linux distributes new connections among the reuse-port listeners. Once a
-connection is accepted, it remains with that worker.
+Each epoll worker owns one listener, one event loop, and one
+`ConnectionManager`; a separate fixed pool processes request handlers. Linux
+distributes new connections among the reuse-port listeners. Once a connection
+is accepted, it remains with that epoll worker.
 
 ```text
 Worker 0: listener -> EpollLoop -> ConnectionManager -> clients
@@ -133,9 +141,12 @@ Worker N: listener -> EpollLoop -> ConnectionManager -> clients
 
 ### Technical view
 
-Worker ownership keeps connection maps and buffers thread-confined. The normal
-read/write path therefore does not need a lock for every client operation.
-Shared shutdown and active-connection state use atomics.
+Worker ownership keeps connection maps, buffers, and socket I/O thread-confined.
+After parsing, an epoll worker submits a copy of the complete request. A pool
+thread routes and serializes it, then posts a completion through an `eventfd`.
+Only the owning epoll thread validates the connection generation, mutates
+buffers, and performs socket I/O. Shared shutdown and active-connection state
+use atomics.
 
 ### In simple terms
 
@@ -168,17 +179,19 @@ client does not hold everyone else up.
 ## 7. Connection State and Request Handling
 
 Each connection stores its file descriptor, an inbound buffer, an
-`HTTPParser`, an outbound buffer, an outbound offset, and peer-close state.
+`HTTPParser`, an outbound buffer, an outbound offset, peer-close state, and a
+generation token used to reject stale pool completions.
 
-The read path is:
+The read and response path is:
 
 1. Read available bytes until the socket returns `EAGAIN`.
 2. Feed each chunk to the connection's incremental `HTTPParser`.
 3. Wait when the parser returns `Incomplete`.
 4. Create `400 Bad Request` when parsing fails.
-5. Route only after the parser returns `Complete`.
-6. Serialize the resulting `HttpResponse`.
-7. Queue and flush the response using non-blocking writes.
+5. Submit a complete request to the bounded shared request pool.
+6. Route and serialize in a pool thread.
+7. Return the response to the owning epoll thread through its completion queue.
+8. Queue and flush the response using non-blocking writes.
 
 TCP is a byte stream, so one HTTP request may arrive in many reads. The parser
 waits for `\r\n\r\n`, parses the request line and headers, reads
@@ -187,7 +200,10 @@ that a socket read equals one HTTP request.
 
 ### Technical view
 
-The server currently processes one request per connection. When `send()` is
+The server currently processes one request per connection. A connection is
+marked in flight while the pool handles its request, preventing duplicate
+dispatch. Completions include a generation token so late results cannot target
+a new connection that reused the same descriptor. When `send()` is
 partial or returns `EAGAIN`, the unsent suffix remains in the outbound buffer;
 the offset identifies the next byte to send. Once the response is flushed, the
 connection is closed.
@@ -244,7 +260,8 @@ The executable currently registers:
 - `GET /health` -> `{"status":"ok"}`.
 - `GET /connections` -> the aggregate active connection count as JSON.
 - `GET /metrics` -> Prometheus text metrics for connections, requests,
-  rejections, parser errors, request duration, and uptime.
+  rejections, parser errors, request duration, uptime, and pool worker count,
+  busy thread count, and queue length.
 
 The active count is atomic because each worker owns a separate connection map.
 
@@ -268,8 +285,11 @@ client to consume unbounded memory. Partial writes are resumed with `EPOLLOUT`.
 
 When a connection closes or fails, the server removes it from `epoll`, erases
 its connection state, decrements the atomic active count, and closes the file
-descriptor. `SIGINT` sets an atomic shutdown flag; workers leave their loops,
-listeners close, and `TCPServer` joins the worker threads.
+descriptor. On `SIGINT` or `SIGTERM`, epoll workers close listeners and stop
+submitting. The pool rejects new work and drains accepted tasks; epoll loops
+stay alive to receive completions and flush responses. Idle or incomplete
+connections are closed, and the server joins both thread groups after task and
+connection counts reach zero.
 
 ### Technical view
 
@@ -294,16 +314,11 @@ rate of 5 requests per second.
 
 `TokenBucket::consume()` uses `steady_clock` to calculate elapsed time, refills
 tokens up to capacity, and consumes one token when available. `RateLimiter`
-stores buckets in an `unordered_map<string, TokenBucket>` protected by a mutex
-because multiple `SO_REUSEPORT` workers share the router's limiter. The router
-checks the client IP after parsing and before handler dispatch. An empty bucket
-produces `429 Too Many Requests`, and the handler is not called.
-
-The process accepts `RATE_LIMIT_CAPACITY` and `RATE_LIMIT_REFILL_RATE` startup
-environment variables for controlled test configurations. The Docker HTTP
-integration suite raises the capacity so its unrelated transport cases do not
-consume the production bucket; focused C++ tests verify the default rejection
-policy directly.
+uses a `shared_mutex` for IP-map lookup/insertion and a per-entry mutex around
+mutable token consumption. Rate-limit values are centralized in `Config` and
+can be set in the config file or overridden from the CLI. The router checks the
+client IP after parsing and before handler dispatch. An empty bucket produces
+`429 Too Many Requests`, and the handler is not called.
 
 ### In simple terms
 
@@ -385,16 +400,6 @@ many connections the network foundation can keep alive.
 ### Implemented
 
 - CMake/C++17 build with strict compiler warnings.
-- Configurable TCP port, backlog, and worker count.
-- IPv4 sockets, non-blocking mode, `epoll`, and `SO_REUSEPORT` workers.
-- Per-worker connection tracking and bounded outbound buffering.
-- Partial-write handling and graceful shutdown.
-- Incremental HTTP request parsing and HTTP response serialization.
-- Header/body limits and malformed-request protection.
-- Exact method/path routing and JSON observability endpoints.
-- Atomic process-wide active-connection accounting.
-- Parser unit tests and Docker TCP connection-ramp testing.
-- Protocol documentation describing the HTTP/binary-TCP split.
 - Docker raw-socket HTTP integration tests with 10 passing cases.
 - Per-IP token-bucket rate limiting with a mutex-protected shared limiter.
 

@@ -206,6 +206,9 @@ def test_metrics_endpoint():
         "gateway_http_request_duration_seconds_sum",
         "gateway_http_request_duration_seconds_count",
         "process_uptime_seconds",
+        "gateway_thread_pool_workers",
+        "gateway_thread_pool_busy_threads",
+        "gateway_thread_pool_queue_length",
     ]
     assert all(sample in first for sample in required_samples)
     assert first["gateway_connections_active"] >= 1
@@ -213,6 +216,9 @@ def test_metrics_endpoint():
     assert first["gateway_http_parse_errors_total"] >= 1
     assert first['gateway_http_responses_total{status_class="4xx"}'] >= 1
     assert first["process_uptime_seconds"] >= 0
+    assert first["gateway_thread_pool_workers"] == 4
+    assert 0 <= first["gateway_thread_pool_busy_threads"] <= 4
+    assert first["gateway_thread_pool_queue_length"] >= 0
 
     status, _, second_body = send_request(request)
     assert status == "HTTP/1.1 200 OK"

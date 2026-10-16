@@ -28,10 +28,23 @@ RateLimiter::RateLimiter(double capacity, double refill_rate)
     : capacity(capacity), refill_rate(refill_rate) {}
 
 bool RateLimiter::check(const std::string& ip) {
-    std::lock_guard<std::mutex> lock(mutex);
-    auto bucket = buckets.find(ip);
-    if (bucket == buckets.end()) {
-        bucket = buckets.emplace(ip, TokenBucket(capacity, refill_rate)).first;
+    std::shared_ptr<BucketEntry> entry;
+    {
+        std::shared_lock<std::shared_mutex> lock(mutex);
+        const auto bucket = buckets.find(ip);
+        if (bucket != buckets.end()) entry = bucket->second;
     }
-    return bucket->second.consume();
+
+    if (!entry) {
+        std::unique_lock<std::shared_mutex> lock(mutex);
+        auto bucket = buckets.find(ip);
+        if (bucket == buckets.end()) {
+            bucket = buckets.emplace(
+                ip, std::make_shared<BucketEntry>(capacity, refill_rate)).first;
+        }
+        entry = bucket->second;
+    }
+
+    std::lock_guard<std::mutex> lock(entry->mutex);
+    return entry->bucket.consume();
 }

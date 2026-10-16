@@ -3,7 +3,9 @@
 #include <chrono>
 #include <cstddef>
 #include <functional>
+#include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <unordered_map>
 
@@ -29,15 +31,22 @@ private:
 // Applies one token bucket to each client IP address.
 class RateLimiter {
 public:
-    // Defaults allow a short burst and five requests per second afterward.
-    explicit RateLimiter(double capacity = 10.0, double refill_rate = 5.0);
+    RateLimiter(double capacity, double refill_rate);
 
     // Return true when the IP may dispatch its next request.
     bool check(const std::string& ip);
 
 private:
+    struct BucketEntry {
+        BucketEntry(double bucket_capacity, double bucket_refill_rate)
+            : bucket(bucket_capacity, bucket_refill_rate) {}
+
+        TokenBucket bucket;
+        std::mutex mutex;
+    };
+
     double capacity;
     double refill_rate;
-    std::mutex mutex;
-    std::unordered_map<std::string, TokenBucket> buckets;
+    std::shared_mutex mutex;
+    std::unordered_map<std::string, std::shared_ptr<BucketEntry>> buckets;
 };

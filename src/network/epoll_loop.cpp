@@ -53,14 +53,16 @@ bool EpollLoop::modify_fd(int fd, unsigned int events) {
 }
 
 // Wait for socket activity and call the server handler for each ready socket.
-bool EpollLoop::run(const function<void(int, unsigned int)>& callback) {
+bool EpollLoop::run(const function<void(int, unsigned int)>& callback,
+                    const function<void()>& on_iteration,
+                    const function<bool()>& should_stop) {
     if (epoll_fd == -1) {
         return false;
     }
 
     epoll_event events[64];
-    while (!shutdown_requested.load(memory_order_relaxed)) {
-        const int event_count = epoll_wait(epoll_fd, events, 64, 1000);
+    while (!should_stop()) {
+        const int event_count = epoll_wait(epoll_fd, events, 64, 100);
         if (event_count == -1) {
             if (errno == EINTR) {
                 continue;
@@ -72,6 +74,8 @@ bool EpollLoop::run(const function<void(int, unsigned int)>& callback) {
         for (int index = 0; index < event_count; ++index) {
             callback(events[index].data.fd, events[index].events);
         }
+        on_iteration();
+        if (should_stop()) break;
     }
 
     return true;

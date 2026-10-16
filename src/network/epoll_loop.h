@@ -30,7 +30,9 @@ public:
     bool modify_fd(int fd, unsigned int events);
 
     // Wait for ready descriptors and pass each one to the callback.
-    bool run(const function<void(int, unsigned int)>& callback);
+    bool run(const function<void(int, unsigned int)>& callback,
+             const function<void()>& on_iteration,
+             const function<bool()>& should_stop);
 
 private:
     int epoll_fd = -1;
