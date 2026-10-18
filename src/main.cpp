@@ -1,5 +1,9 @@
 #include "network/tcp_server.h"
 
+#include <chrono>
+#include <cstdlib>
+#include <thread>
+
 int main(int argc, char* argv[]) {
     Config config;
     try {
@@ -37,10 +41,23 @@ int main(int argc, char* argv[]) {
     server.add_route("GET", "/recent", [&server](const HttpRequest& request) {
         return server.recent_messages_response(request);
     });
+    server.add_route("POST", "/publish", [&server](const HttpRequest& request) {
+        if (request.body.empty()) {
+            return HttpResponse{400, "Bad Request", {}, "Request body is required"};
+        }
+        const std::uint64_t offset = server.append_message(request.body);
+        return HttpResponse{201, "Created", {}, std::to_string(offset)};
+    });
     server.add_route("GET", "/large-response", [](const HttpRequest&) {
         // This deterministic payload exercises queued output and EPOLLOUT tests.
         return HttpResponse{200, "OK", {}, string(512 * 1024, 'x')};
     });
+    if (std::getenv("GATEWAY_TEST_MODE") != nullptr) {
+        server.add_route("GET", "/test/hold", [](const HttpRequest&) {
+            std::this_thread::sleep_for(std::chrono::seconds(15));
+            return HttpResponse{200, "OK", {}, "held"};
+        });
+    }
 
     // start() returns false for operating-system setup failures
     if (!server.start()) {

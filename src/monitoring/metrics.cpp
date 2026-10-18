@@ -1,5 +1,6 @@
 #include "metrics.h"
 
+#include <algorithm>
 #include <iomanip>
 #include <sstream>
 
@@ -9,26 +10,40 @@ Metrics::Metrics() : process_start(Clock::now()) {
     }
 }
 
-void Metrics::connection_opened() {
+void Metrics::set_epoll_worker_count(std::size_t count) {
+    epoll_worker_count.store(std::min(count, epoll_workers.size()), std::memory_order_relaxed);
+}
+
+void Metrics::connection_opened(std::size_t worker_id) {
     accepted_connections.fetch_add(1, std::memory_order_relaxed);
     open_connections.fetch_add(1, std::memory_order_relaxed);
+    if (worker_id < epoll_workers.size()) {
+        epoll_workers[worker_id].accepted_connections.fetch_add(1, std::memory_order_relaxed);
+    }
 }
 
 void Metrics::connection_closed() {
     open_connections.fetch_sub(1, std::memory_order_relaxed);
 }
 
-void Metrics::request_started() {
+void Metrics::request_started(std::size_t worker_id) {
     requests.fetch_add(1, std::memory_order_relaxed);
+    if (worker_id < epoll_workers.size()) {
+        epoll_workers[worker_id].requests.fetch_add(1, std::memory_order_relaxed);
+    }
 }
 
-void Metrics::request_completed(int status_code, std::chrono::duration<double> elapsed) {
+void Metrics::request_completed(int status_code, std::chrono::duration<double> elapsed,
+                                std::size_t worker_id) {
     if (status_code >= 100 && status_code < 600) {
         response_status_classes[static_cast<std::size_t>(status_code / 100 - 1)]
             .fetch_add(1, std::memory_order_relaxed);
     }
     if (status_code == 429) {
         blocked_requests.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (worker_id < epoll_workers.size()) {
+        epoll_workers[worker_id].completed_requests.fetch_add(1, std::memory_order_relaxed);
     }
 
     const double seconds = elapsed.count();
@@ -42,6 +57,15 @@ void Metrics::request_completed(int status_code, std::chrono::duration<double> e
     }
 }
 
+void Metrics::completion_queue_size(std::size_t worker_id, std::size_t size) {
+    if (worker_id >= epoll_workers.size()) return;
+    auto& worker = epoll_workers[worker_id];
+    worker.completion_queue_depth.store(size, std::memory_order_relaxed);
+    std::size_t maximum = worker.completion_queue_high_water.load(std::memory_order_relaxed);
+    while (size > maximum && !worker.completion_queue_high_water.compare_exchange_weak(
+               maximum, size, std::memory_order_relaxed)) {}
+}
+
 void Metrics::parse_error() {
     parse_errors.fetch_add(1, std::memory_order_relaxed);
 }
@@ -53,7 +77,8 @@ std::size_t Metrics::active_connections() const {
 std::string Metrics::prometheus_text(std::size_t pool_workers,
                                      std::size_t busy_threads,
                                      std::size_t queue_length,
-                                     std::uint64_t log_disk_bytes) const {
+                                     std::uint64_t log_disk_bytes,
+                                     std::size_t queue_high_water) const {
     std::ostringstream output;
     output << std::setprecision(9);
     output << "# HELP gateway_connections_active Current open client connections.\n"
@@ -116,8 +141,26 @@ std::string Metrics::prometheus_text(std::size_t pool_workers,
             << "# HELP gateway_thread_pool_queue_length Queued request tasks.\n"
             << "# TYPE gateway_thread_pool_queue_length gauge\n"
                << "gateway_thread_pool_queue_length " << queue_length << '\n'
+               << "# HELP gateway_thread_pool_queue_high_water Maximum shared request-pool queue depth since startup.\n"
+               << "# TYPE gateway_thread_pool_queue_high_water gauge\n"
+               << "gateway_thread_pool_queue_high_water " << queue_high_water << '\n'
                << "# HELP gateway_log_disk_bytes Provisioned bytes across pre-sized log segment files.\n"
                << "# TYPE gateway_log_disk_bytes gauge\n"
                << "gateway_log_disk_bytes " << log_disk_bytes << '\n';
+    const std::size_t worker_count = epoll_worker_count.load(std::memory_order_relaxed);
+    for (std::size_t worker_id = 0; worker_id < worker_count; ++worker_id) {
+        const auto& worker = epoll_workers[worker_id];
+        output << "gateway_epoll_worker_connections_accepted_total{worker=\"" << worker_id
+               << "\"} " << worker.accepted_connections.load(std::memory_order_relaxed) << '\n'
+               << "gateway_epoll_worker_requests_total{worker=\"" << worker_id << "\"} "
+               << worker.requests.load(std::memory_order_relaxed) << '\n'
+               << "gateway_epoll_worker_requests_completed_total{worker=\"" << worker_id
+               << "\"} " << worker.completed_requests.load(std::memory_order_relaxed) << '\n'
+               << "gateway_epoll_worker_completion_queue_depth{worker=\"" << worker_id
+               << "\"} " << worker.completion_queue_depth.load(std::memory_order_relaxed) << '\n'
+               << "gateway_epoll_worker_completion_queue_high_water{worker=\"" << worker_id
+               << "\"} " << worker.completion_queue_high_water.load(std::memory_order_relaxed)
+               << '\n';
+    }
     return output.str();
 }

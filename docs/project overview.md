@@ -36,10 +36,10 @@ The project has been built in layers:
 8. Versioned segmented mmap storage, restart recovery, and a recovered recent
   message cache.
 
-The networking, HTTP transport, and persistent-log layers are implemented.
-Telemetry business logic is not complete: HTTP request bodies are still opaque
-strings, and there is no validated producer route that appends telemetry or
-delivers it downstream.
+The networking, HTTP transport, and persistent-log layers are implemented. A
+minimal `POST /publish` route appends non-empty request bodies as opaque records
+and returns their storage offset. Telemetry JSON validation and downstream
+delivery are not implemented yet.
 
 ### Technical view
 
@@ -63,6 +63,8 @@ The gateway has two distinct protocol roles:
   The intended application request is `POST /publish` with JSON in the body.
 - **The gateway** parses the HTTP message, validates its framing and limits,
   then routes a complete request to an application handler.
+- A minimal `POST /publish` handler stores non-empty opaque request bodies; it
+  does not validate telemetry JSON.
 - **Consumers**, planned for Week 9, will receive telemetry through a separate
   binary TCP protocol. They will not use the producer-facing HTTP parser.
 
@@ -267,9 +269,15 @@ The executable currently registers:
 - `GET /health` -> `{"status":"ok"}`.
 - `GET /connections` -> the aggregate active connection count as JSON.
 - `GET /metrics` -> Prometheus text metrics for connections, requests,
-  rejections, parser errors, request duration, uptime, and pool worker count,
-  busy thread count, queue length, and log segment-file bytes.
+  rejections, parser errors, request duration, uptime, pool worker count and
+  busy threads, shared task-queue length/high-water, per-epoll-worker accepted
+  connection/request/completion counters and completion-queue depth/high-water,
+  and log segment-file bytes.
 - `GET /recent` -> recent messages from the in-memory cache, serialized as JSON.
+- `POST /publish` -> appends a non-empty opaque request body and returns its
+  storage offset; it does not validate telemetry JSON.
+- `GET /test/hold` -> test-only delayed handler, registered only when
+  `GATEWAY_TEST_MODE` is set.
 
 The active count is atomic because each worker owns a separate connection map.
 
@@ -385,9 +393,11 @@ The suite covers:
 - Header normalization, repeated headers, and conflicting lengths.
 - Header and body size-limit rejection.
 - Exact routing and `404 Not Found` responses.
-- Per-IP rate limiting and `429 Too Many Requests` responses.
 - 100 concurrent HTTP clients.
 - Slow-reader delivery of the 512 KiB `/large-response` body.
+- `/recent` cache response and count query validation.
+- `/metrics` Prometheus exposition, counter/histogram advancement, and required gauges.
+- `/publish` empty-body rejection and opaque-body persistence.
 
 The command used was:
 
@@ -398,7 +408,7 @@ The command used was:
 The observed result was:
 
 ```text
-PASS all HTTP integration tests (10)
+PASS all HTTP integration tests (13)
 http-test exited with code 0
 ```
 
@@ -409,28 +419,32 @@ clients, and completes a large response through the outbound queue and
 expected because the test runner stops the gateway after the test container
 finishes.
 
-The Docker load test uses `scripts/tcp_load_generator.py` to create many raw
-TCP clients, verify an echo payload, hold connections open, and report
-failures. Recorded connection-ramp results include a successful 50,000-client
-run after increasing the load-generator container's ephemeral source-port
-range and file-descriptor limits.
-
-That load test is a historical raw TCP echo test. It does not test the current
-HTTP parser or telemetry validation. The raw-socket HTTP integration suite now
-covers real partial TCP reads and partial response delivery separately.
+The staged backend test implements the Final Testing Plan: pass criteria are
+established before running (zero failures, zero error responses, clean exit,
+100% recovery); environment parameters (hardware, Docker limits, ephemeral port
+range, rate-limit override rationale) are documented in `docs/tests.md`; and
+each stage verifies connection load, shutdown under in-flight work, and
+persistence across restart. The raw TCP load test uses
+`scripts/tcp_load_generator.py` to create clients, verify an echo payload, and
+hold connections open. The additional `scripts/run_backend_tests.py` workflow
+tests HTTP request handling at 100, 500, 1,000, 2,500, 5,000, 10,000, 20,000,
+30,000, and 50,000 concurrent clients; at every stage it exercises graceful
+shutdown, restarts the gateway, and verifies acknowledged writes. Detailed stage
+measurements are in [tests.md](tests.md), with the overall outcome in
+[results.md](results.md).
 
 ### Technical view
 
 Unit tests isolate parser behavior. The HTTP integration suite exercises the
 real connection acceptance, epoll, parser, router, response, buffering, and
-cleanup path. The 50,000-client Docker test remains focused on raw TCP
-connection retention and scale.
+cleanup path. The staged HTTP backend test adds request concurrency, graceful
+drain, and persistent restart verification up to 50,000 simultaneous clients.
 
 ### In simple terms
 
 The small tests check individual rules, the HTTP suite checks the real server
-with realistic broken and slow clients, and the 50,000-client test checks how
-many connections the network foundation can keep alive.
+with realistic broken and slow clients, and the staged backend test measures
+HTTP handling, graceful shutdown, and recovery at scale.
 
 ## 14. Implemented, Planned, and Limited
 
@@ -445,33 +459,45 @@ many connections the network foundation can keep alive.
 - A recovered recent-message cache exposed through `GET /recent`.
 - Provisioned segment-file capacity exposed in `/metrics` as
   `gateway_log_disk_bytes`.
+- Shared thread-pool queue high-water and per-epoll-worker request/completion
+  queue metrics.
+- Opaque-body persistence through `POST /publish`.
+- Per-epoll-worker accepted/request/completion counters and completion-queue
+  depth/high-water metrics, plus shared request-pool queue high-water.
+- Minimal opaque-body `POST /publish` persistence route; test-only shutdown hold
+  route is enabled only with `GATEWAY_TEST_MODE`.
+- Staged HTTP concurrency, graceful shutdown, and restart-recovery tests through
+  50,000 concurrent clients.
+- Current verification: 31/31 C++ tests and 13/13 HTTP integration tests pass;
+  all nine concurrency stages passed. See [tests.md](tests.md) and
+  [results.md](results.md) for the measured details.
 - C++ tests for configuration, pool behavior, rate limiting, storage recovery,
   rollover boundaries, oversized records, cache ordering, JSON escaping,
   metrics, and shutdown drain.
 
 ### Planned next
 
-- Implement `POST /publish`.
 - Parse and validate telemetry JSON and field ranges.
 - Persist or forward validated telemetry through the new log API.
 - Implement the Week 9 binary consumer protocol.
 - Add authentication and broader spam/DDoS protection.
 - Add downstream backpressure and failure-recovery tests.
-- Run the updated Docker HTTP suite and pooled-server load tests.
+- Repeat the staged load test on additional host hardware and with a sustained
+  workload profile.
 
 ### Current limitations
 
 - Telemetry JSON is not yet validated by an application handler.
 - There is no authentication or authorization.
-- The storage API exists, but no application telemetry route currently writes
-  producer requests into it.
+- `POST /publish` stores opaque non-empty bodies but does not validate telemetry
+  JSON or deliver records downstream.
 - `gateway_log_disk_bytes` measures preallocated segment capacity, not only
   bytes containing valid records.
 - Keep-alive and pipelining are not implemented; connections close after one response.
 - Chunked transfer encoding is rejected.
 - The queue limit is a fixed safe default, not workload-specific tuning.
-- The Docker load test remains a raw TCP connection-retention test; the updated
-  pooled HTTP integration suite has not yet been recorded as run.
+- The staged capacity result applies only to this single-host/container
+  configuration and is not a production or multi-host guarantee.
 - Inactive IP buckets are not yet expired, so the limiter map needs bounded
   cleanup before hostile high-cardinality traffic is considered production-safe.
 

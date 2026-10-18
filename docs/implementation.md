@@ -124,14 +124,17 @@ append and cache reads with its mutex. `GET /recent` serializes that cache
 without scanning disk per request. It accepts an optional `count` query
 parameter, defaults to 100, permits values from 0 through 1000, and returns
 `400 Bad Request` for malformed, repeated, unknown, or over-limit query values.
-The returned set is chronological, oldest-to-newest. The persistent log exposes
-an append API for the future publish path; `POST /publish` is not added in this
-step. The `gateway_log_disk_bytes` metric sums segment file lengths and
-represents provisioned segment capacity, not only valid record bytes.
+The returned set is chronological, oldest-to-newest. The executable's minimal
+`POST /publish` route rejects an empty body with `400`, appends a non-empty body
+as an opaque record, and returns `201 Created` with the record offset. It does
+not validate telemetry JSON. The `gateway_log_disk_bytes` metric sums segment
+file lengths and represents provisioned segment capacity, not only valid
+record bytes.
 
 ## 3. Load Testing and Container Support
 
-The project includes a Docker build and a connection-ramp test setup.
+The project includes a Docker build, a raw TCP connection-ramp test, a real HTTP
+integration suite, and a staged pooled-HTTP load/shutdown/recovery test.
 
 `docker/Dockerfile` builds the C++ gateway inside Ubuntu 24.04. The Compose
 configuration starts the gateway with multiple workers and a Python load-test
@@ -144,11 +147,28 @@ limited by both application behavior and operating-system resource limits.
 `scripts/tune_limits.sh` documents useful host settings, while Compose applies
 container-level `nofile` limits.
 
-This test design was chosen to expose connection leaks, accept failures,
-backpressure problems, and unexpected server closes under sustained concurrent
-connections. It is intentionally separate from parser tests: load tests answer
-whether the network service remains usable at scale, while unit tests answer
-whether protocol logic is correct.
+The raw TCP test exposes connection leaks, accept failures, and unexpected
+closes while holding sockets open. `scripts/run_backend_tests.py` adds stages
+of 100, 500, 1,000, 2,500, 5,000, 10,000, 20,000, 30,000, and 50,000
+concurrent HTTP clients. It samples metrics, triggers graceful shutdown with
+work in flight, restarts the gateway against stage-specific storage, and
+verifies every acknowledged write. Raw data is kept under ignored
+`build/backend-test-results/`; the measured report is `docs/tests.md`.
+
+The Final Testing Plan established pass criteria before each stage run:
+zero connection/send/response failures, zero `429`/`503` responses, zero parse
+errors, exit code 0 on graceful shutdown, and 100% recovery of acknowledged
+writes. Every stage is also required to successfully restart the gateway against
+the same persistent storage. All nine stages satisfied these criteria on the
+recorded run (2026-10-18).
+
+Each stage uses eight `SO_REUSEPORT` epoll workers, a shared 16-thread request
+pool, one shared task queue, and one completion queue per epoll worker. The
+shared task queue has no per-epoll-worker depth. Its length and high-water mark
+are aggregate metrics, while completion queue depth and high-water are labeled
+by worker. The test raises the rate-limit allowance and container file/port
+limits so they do not prematurely cap the load. Its `/test/hold` handler is
+registered only when `GATEWAY_TEST_MODE` is set; normal runs do not expose it.
 
 ## 4. HTTP Request Processing
 
@@ -253,13 +273,19 @@ The executable currently registers these endpoints:
   `gateway_http_requests_blocked_total`, `gateway_http_parse_errors_total`,
   `gateway_http_responses_total` grouped by status class,
   `gateway_http_request_duration_seconds`, `process_uptime_seconds`,
-  `gateway_thread_pool_workers`, `gateway_thread_pool_busy_threads`, and
-  `gateway_thread_pool_queue_length`, and `gateway_log_disk_bytes`. The latter
-  is a gauge of provisioned segment-file bytes because segments are pre-sized.
+  `gateway_thread_pool_workers`, `gateway_thread_pool_busy_threads`, shared
+  task-queue length/high-water, per-worker accepted/request/completion counters,
+  per-worker completion-queue depth/high-water, and `gateway_log_disk_bytes`.
+  The latter is a gauge of provisioned segment-file bytes because segments are
+  pre-sized.
 - `GET /recent` returns the configured number of newest messages from the
   in-memory circular cache as JSON.
 - `GET /large-response` returns a deterministic 512 KiB body for transport
   tests of slow readers and partial writes.
+- `POST /publish` appends a non-empty body as an opaque record and returns its
+  offset; it does not validate telemetry JSON.
+- `GET /test/hold` sleeps for 15 seconds and is registered only when
+  `GATEWAY_TEST_MODE` is set for shutdown testing.
 
 The metrics collector counts each complete parsed request immediately before
 router dispatch; malformed requests are counted separately. Rate-limited
@@ -275,9 +301,9 @@ incremented after a client is accepted and decremented when that client is
 removed. This provides one safe aggregate value without reading another
 worker's map or adding locks to the normal connection path.
 
-The telemetry contract reserves `POST /publish` for telemetry JSON, but a
-publish handler and JSON validation/storage are application-level work still to
-be added.
+The telemetry contract reserves `POST /publish` for telemetry JSON, but the
+current handler stores a non-empty body as an opaque record without JSON
+validation or downstream delivery.
 
 The large-response endpoint is intentionally simple and deterministic. It is a
 transport test surface, not a telemetry feature: the body consists of repeated
@@ -331,6 +357,7 @@ The suite covers:
 - 100 concurrent raw-socket HTTP clients.
 - A slow reader consuming a 512 KiB response in small chunks.
 - `/recent` empty-cache JSON and query validation, plus `/metrics` exposition.
+- `/publish` empty-body rejection and opaque-body persistence visibility.
 
 The last case uses `GET /large-response`, a deterministic transport-test
 endpoint that returns 512 KiB of `x` bytes. The client limits its receive
@@ -346,7 +373,8 @@ These tests complement the other test layers:
 HTTPParser C++ unit tests       -> parser logic in isolation
 raw-socket HTTP integration     -> real TCP server, parser, router, responses
 slow-reader integration         -> partial writes and EPOLLOUT backpressure
-50,000-client Docker load test  -> connection-scale stability and retention
+raw TCP connection-ramp test     -> connection retention
+backend HTTP stage test          -> concurrency, shutdown drain, and recovery
 ```
 
 Focused C++ tests also cover config-file/CLI precedence, pool queue capacity and
@@ -362,11 +390,11 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-The HTTP integration metrics check verifies `gateway_thread_pool_workers`,
-`gateway_thread_pool_busy_threads`, `gateway_thread_pool_queue_length`, and
-`gateway_log_disk_bytes`; it also checks that an empty cache produces `[]` at
-`GET /recent`, as well as query validation for zero, malformed, unknown,
-repeated, and over-limit values.
+The latest Docker HTTP integration run passed all 13 cases. Its metrics check
+verifies `gateway_thread_pool_workers`, `gateway_thread_pool_busy_threads`,
+shared queue length/high-water, per-worker metrics, and
+`gateway_log_disk_bytes`. It also verifies an empty cache and `/recent` query
+validation for zero, malformed, unknown, repeated, and over-limit values.
 
 `mmap_log_tests` verifies restart persistence, variable and empty payloads,
 segment rollover and global offsets, exact-fit rollover, oversized-record
@@ -381,31 +409,50 @@ invalid and over-limit counts, JSON escaping, response content type, configured
 segment-size metrics, and graceful response draining. `metrics_tests` checks
 that the disk gauge's help text describes provisioned bytes.
 
-The suite intentionally does not test telemetry JSON validation yet because
-`POST /publish` has not been implemented. Once that handler exists, the same
-Docker test should add valid and invalid telemetry requests and assert the
-application-level response.
+The integration suite verifies that `/publish` rejects an empty body and stores
+a non-empty opaque body. It does not validate telemetry JSON or field ranges.
+
+Run the staged backend test with:
+
+```bash
+python3 scripts/run_backend_tests.py
+```
+
+Set `BACKEND_TEST_STAGES=100,500` to select stages. The runner stores raw
+per-stage JSONL in `build/backend-test-results/stage-results.jsonl`. Its own
+`/metrics` probes are included in server counters, so aggregate counts may be a
+little higher than the load-generator cohort. See [tests.md](tests.md) for
+measured results and caveats. The Final Testing Plan recorded in `docs/tests.md`
+established pass criteria before running (zero failures, zero error responses,
+clean exit, 100% recovery) and documented environment parameters (host
+hardware, Docker limits, ephemeral-port range, rate-limit override rationale).
+The latest run (2026-10-18) passed all nine configured stages through 50,000
+concurrent clients. Each stage connected the full cohort, sent one test-only
+held request plus opaque writes for the other clients, initiated SIGTERM while
+work was in flight, verified the in-flight count at signal time, restarted with
+the same stage-specific log, and verified every acknowledged write.
+Per-stage recovery and shutdown passed at all nine stages.
 
 ## 5. Telemetry Contract
 
-Telemetry is sent as JSON in the body of `POST /publish`. The documented event
-shape is defined in [protocol.md](protocol.md):
+Telemetry is intended to be sent as JSON in the body of `POST /publish`. The
+documented event shape is defined in [protocol.md](protocol.md):
 
 ```text
 TelemetryEvent {
-    vehicle_id: string
-    lat: number
-    lng: number
-    speed: number
-    status: "moving" | "idle" | "offline"
-    timestamp: integer
+  vehicle_id: string
+  lat: number
+  lng: number
+  speed: number
+  status: "moving" | "idle" | "offline"
+  timestamp: integer
 }
 ```
 
-The HTTP transport currently treats the body as an opaque string. This is
-intentional separation of responsibilities: the transport assembles a complete
-body, while the future publish handler will validate the JSON, apply telemetry
-rules, store or forward the event, and produce the application response.
+The current `POST /publish` implementation treats the body as an opaque string
+and appends it to persistent storage. JSON parsing, field validation, and
+downstream delivery remain future application work. This keeps HTTP framing
+separate from the meaning and policy of telemetry records.
 
 No additional telemetry endpoint is needed. `POST /publish` is the intended
 application contract.
@@ -467,20 +514,27 @@ Implemented today:
 - Atomic process-wide active-connection accounting across workers.
 - Parser unit tests and live health/404 checks.
 - Docker raw-socket HTTP integration tests for complete, fragmented, malformed,
-  concurrent, size-limit, routing, connection-close, and slow-reader cases.
+  concurrent, size-limit, routing, connection-close, slow-reader, and
+  publish/recent/metrics cases (13 cases total).
 - Focused C++ rate-limiter tests for burst/refill behavior, per-IP isolation,
   and handler bypass on `429 Too Many Requests`.
 - Config, pool saturation/drain, concurrent limiter, and server shutdown tests.
-- Pool worker, busy-thread, and queue-length metrics.
+- Pool worker, busy-thread, shared queue length/high-water, and per-epoll-worker
+  request/completion-queue metrics.
 - Segmented mmap log with CRC-checked records, offset tracking, and startup recovery.
 - Recent-message cache and `GET /recent`; log capacity gauge in `/metrics`.
 - Storage recovery, rollover, circular-cache, and recent-route test coverage.
 - A deterministic large-response endpoint for testing partial response writes.
+- Opaque-body `POST /publish` persistence route and opt-in shutdown hold route.
+- Staged HTTP concurrency, graceful-shutdown, and persistence-recovery tests
+  (100 through 50,000 concurrent clients; 9 stages, all passed).
+- Final Testing Plan with pre-run pass criteria, environment documentation,
+  per-stage shutdown and persistence verification, and per-worker metrics.
 - Telemetry event documentation.
+- Comprehensive test report in `docs/tests.md` and results summary in `docs/results.md`.
 
 Still to implement:
 
-- Register the `POST /publish` handler.
 - Validate telemetry JSON and its field ranges.
 - Connect validated `POST /publish` messages to persistent append and downstream delivery.
 - Add authentication, rate limiting, and spam/DDoS protection.
@@ -488,5 +542,5 @@ Still to implement:
 - Add chunked transfer encoding if required.
 - Add application-level telemetry and failure tests.
 - Add inactive-IP bucket expiration and a bounded limiter map.
-- Replace the transport-only HTTP integration fixtures with telemetry-aware
-    tests once `POST /publish` is implemented.
+- Add application-level telemetry tests after JSON validation and delivery are
+  implemented.

@@ -128,6 +128,7 @@ TCPServer::~TCPServer() {
 bool TCPServer::start() {
     shutdown_requested.store(false, memory_order_relaxed);
     worker_failed.store(false, memory_order_relaxed);
+    metrics.set_epoll_worker_count(epoll_worker_count);
     try {
         storage_log.open(config.storage_directory, config.storage_segment_size,
                          config.recent_message_capacity);
@@ -218,6 +219,7 @@ void TCPServer::worker_loop(unsigned int worker_id) {
     EpollLoop loop;
     ConnectionManager connections;
     LoopState state;
+    state.worker_id = worker_id;
     state.completion_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
     if (state.completion_fd == -1) {
         perror("eventfd");
@@ -366,7 +368,7 @@ void TCPServer::accept_clients(EpollLoop& loop, ConnectionManager& connections,
         }
 
         connections.add(client_fd, client_ip, state.next_generation++);
-        metrics.connection_opened();
+        metrics.connection_opened(state.worker_id);
     }
 }
 
@@ -413,7 +415,7 @@ void TCPServer::handle_client(EpollLoop& loop, ConnectionManager& connections,
         }
 
         if (status == ParseStatus::Complete) {
-            metrics.request_started();
+            metrics.request_started(state.worker_id);
             const std::uint64_t generation = connection->generation;
             const HttpRequest request = connection->parser.request();
             const string client_ip = connection->client_ip;
@@ -440,6 +442,8 @@ void TCPServer::handle_client(EpollLoop& loop, ConnectionManager& connections,
                     {
                         lock_guard<mutex> lock(state.completion_mutex);
                         state.completions.push(std::move(completion));
+                        metrics.completion_queue_size(state.worker_id,
+                                                      state.completions.size());
                     }
                     const std::uint64_t notification = 1;
                     ssize_t result;
@@ -455,12 +459,12 @@ void TCPServer::handle_client(EpollLoop& loop, ConnectionManager& connections,
                                               "Service Unavailable"};
                 connection->outbound.append(overloaded.to_string());
                 connection->peer_closed = true;
-                metrics.request_completed(503, chrono::duration<double>::zero());
+                metrics.request_completed(503, chrono::duration<double>::zero(),
+                                          state.worker_id);
                 flush_client(loop, connections, client_fd);
             }
             break;
         }
-
         if (connection->parser.error().size() > 0) {
             close_client(loop, connections, client_fd);
             return;
@@ -482,11 +486,12 @@ void TCPServer::process_completions(EpollLoop& loop, ConnectionManager& connecti
     {
         lock_guard<mutex> lock(state.completion_mutex);
         swap(completed, state.completions);
+        metrics.completion_queue_size(state.worker_id, state.completions.size());
     }
     while (!completed.empty()) {
         Completion completion = std::move(completed.front());
         completed.pop();
-        metrics.request_completed(completion.status_code, completion.elapsed);
+        metrics.request_completed(completion.status_code, completion.elapsed, state.worker_id);
         Connection* connection = connections.get(completion.client_fd);
         if (connection != nullptr && connection->generation == completion.generation &&
             connection->request_in_flight) {

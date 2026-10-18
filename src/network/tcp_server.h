@@ -72,9 +72,10 @@ public:
     }
 
     string metrics_text() const {
-        const auto stats = thread_pool ? thread_pool->stats() : ThreadPool::Stats{0, 0, 0};
+        const auto stats = thread_pool ? thread_pool->stats() : ThreadPool::Stats{0, 0, 0, 0};
         return metrics.prometheus_text(stats.worker_count, stats.busy_threads,
-                                       stats.queue_length, storage_log.disk_usage_bytes());
+                                       stats.queue_length, storage_log.disk_usage_bytes(),
+                                       stats.queue_high_water);
     }
 
     std::string recent_messages_json(std::size_t count = 100) const;
@@ -102,6 +103,7 @@ private:
         queue<Completion> completions;
         atomic<size_t> outstanding_tasks{0};
         std::uint64_t next_generation = 1;
+        std::size_t worker_id = 0;
         bool draining = false;
     };
 

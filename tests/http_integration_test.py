@@ -209,6 +209,7 @@ def test_metrics_endpoint():
         "gateway_thread_pool_workers",
         "gateway_thread_pool_busy_threads",
         "gateway_thread_pool_queue_length",
+        "gateway_thread_pool_queue_high_water",
         "gateway_log_disk_bytes",
     ]
     assert all(sample in first for sample in required_samples)
@@ -220,6 +221,11 @@ def test_metrics_endpoint():
     assert first["gateway_thread_pool_workers"] == 4
     assert 0 <= first["gateway_thread_pool_busy_threads"] <= 4
     assert first["gateway_thread_pool_queue_length"] >= 0
+    assert first["gateway_thread_pool_queue_high_water"] >= first[
+        "gateway_thread_pool_queue_length"
+    ]
+    assert first['gateway_epoll_worker_requests_total{worker="0"}'] >= 1
+    assert first['gateway_epoll_worker_completion_queue_high_water{worker="0"}'] >= 0
     assert first["gateway_log_disk_bytes"] >= 1
 
     status, _, second_body = send_request(request)
@@ -293,6 +299,27 @@ def test_slow_reader_partial_response():
     assert body == b"x" * (512 * 1024)
 
 
+def test_publish_appends_and_recent_recovers_message():
+    status, _, body = send_request(
+        b"POST /publish HTTP/1.1\r\nHost: gateway\r\nContent-Length: 0\r\n\r\n"
+    )
+    assert status == "HTTP/1.1 400 Bad Request"
+    payload = b"integration-persistent-record"
+    request = (
+        b"POST /publish HTTP/1.1\r\nHost: gateway\r\nContent-Length: "
+        + str(len(payload)).encode("ascii")
+        + b"\r\n\r\n"
+        + payload
+    )
+    status, _, _ = send_request(request)
+    assert status == "HTTP/1.1 201 Created"
+    status, _, recent = send_request(
+        b"GET /recent?count=1 HTTP/1.1\r\nHost: gateway\r\n\r\n"
+    )
+    assert status == "HTTP/1.1 200 OK"
+    assert b'"payload":"integration-persistent-record"' in recent
+
+
 def main():
     tests = [
         test_health_request,
@@ -307,6 +334,7 @@ def main():
         test_slow_reader_partial_response,
         test_recent_endpoint,
         test_metrics_endpoint,
+        test_publish_appends_and_recent_recovers_message,
     ]
     for test in tests:
         test()
