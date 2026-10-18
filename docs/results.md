@@ -1,49 +1,24 @@
 # Results and Conclusions
 
-## 1. Build and Unit-Test Results
+## 1. Executive Summary (Latest Run — 2026-10-18)
 
-A full build and CTest run after registering individual cases completed
-successfully: all 31 C++ test cases passed. The build emitted a repeated
-`backslash-newline at end of file` warning from `tests/test_runner.h`; the
-macro was subsequently reformatted to remove the line continuation. That
-warning-only edit has not yet been rebuilt and rerun in the reported output.
+All test categories passed on this run. Detailed environment, metric definitions, per-worker vectors, stage data, and analytical notes are in [tests.md](tests.md).
 
-The earlier focused recovery/integration and full-suite runs used:
+| Test category | Outcome |
+| --- | --- |
+| C++ CTest (31 cases) | **31/31 passed** |
+| Docker HTTP integration (13 cases) | **13/13 passed** |
+| Staged HTTP concurrency — 9 stages | **9/9 passed** |
+| Graceful shutdown under load | **9/9 clean exits** |
+| Persistence recovery across restart | **9/9 exact acknowledged-record sets recovered** |
 
-```bash
-cmake --build build --target mmap_log_tests tcp_server_drain_tests
-ctest --test-dir build -R '^(mmap_log_tests|tcp_server_drain_tests)$' --output-on-failure
-ctest --test-dir build --output-on-failure
-```
+---
 
-The final full-suite output was:
+## 2. Build and Unit-Test Results
 
-```text
-http_parser_tests   Passed
-rate_limiter_tests  Passed
-metrics_tests       Passed
-config_tests        Passed
-thread_pool_tests   Passed
-tcp_server_drain_tests Passed
-mmap_log_tests      Passed
-circular_buffer_tests Passed
+### 2.1 Full suite
 
-100% tests passed, 0 tests failed out of 8
-Total Test time = 0.06 sec
-```
-
-The focused rerun before the full per-case registration was:
-
-```bash
-cmake --build build --target tcp_server_drain_tests
-./build/tcp_server_drain_tests
-```
-
-The target built successfully and the test executable exited with code `0`.
-Its `/recent?count=1` assertion now checks that the single returned message is
-the newest, escaped-payload seed rather than the preceding message.
-
-The latest full run was performed with:
+The full 31-case C++ CTest suite was run with:
 
 ```bash
 cmake -S . -B build
@@ -51,125 +26,33 @@ cmake --build build --parallel 2
 ctest --test-dir build --output-on-failure
 ```
 
-CTest reported each named case individually, ending with:
+Result:
 
 ```text
 100% tests passed, 0 tests failed out of 31
-Total Test time (real) = 0.16 sec
+Total Test time (real) = 0.23 sec
 ```
 
-The C++ test targets and their verified behavior are:
+### 2.2 Covered behaviors
 
-- `http_parser_tests`: fragmented headers and bodies, `Content-Length`
-	completion, requests without bodies, case-insensitive header lookup,
-	query/path separation, malformed requests, conflicting lengths, unsupported
-	chunked encoding, and header/body size limits.
-- `rate_limiter_tests`: fake-clock token-bucket burst/refill/cap behavior,
-	zero-rate behavior, independent IP buckets, 429 handler bypass, and
-	concurrent same-IP consumption capped at the bucket's 20-token capacity.
-- `metrics_tests`: connection lifecycle, request/blocked counts, response
-	classes, duration histogram, parse errors, and process uptime.
-- `config_tests`: config-file parsing, CLI override precedence, invalid-value
-	rejection, and unknown-key rejection.
-- `thread_pool_tests`: fixed worker stats, bounded-queue rejection, rejection
-	after shutdown starts, draining of already accepted tasks, and continued
-	worker operation after a task throws.
-- `tcp_server_drain_tests`: an in-flight route handler is held while the server
-	receives the SIGTERM shutdown signal; after release, the response is
-	delivered before the server thread joins, and the pool worker metric is
-	present. It appends three messages through the server API, checks chronological
-	ordering, verifies `count=1` selects the newest escaped payload, checks JSON
-	escaping, and verifies segment-file bytes in `/metrics`. The updated target
-	passed in both its focused rerun and the 31-case CTest run.
-- `mmap_log_tests`: append/read across close and reopen, variable and empty
-	payloads, global offsets across segment rollover, exact-fit rollover,
-	oversized-record rejection, incomplete-header/payload recovery, detection of
-	payload bytes left before a missing header, active-tail checksum rejection,
-	and fatal corruption in a sealed segment. All expanded cases passed in the
-	latest 31-case CTest run.
-- `circular_buffer_tests`: chronological reads before and after wraparound,
-	exact-capacity fills, zero/oversized reads, and capacity-one replacement.
-
-`metrics_tests` verifies the log disk-byte gauge. The HTTP integration test
-checks the pool gauges, disk usage, and an empty `/recent` response through the
-running server.
-
-## 2. HTTP Verification Results
-
-Before the request-pool change, the running gateway was checked over a real TCP
-connection:
-
-| Request | Result |
+| Test target | Behaviors verified |
 | --- | --- |
-| `GET /health` | `HTTP/1.1 200 OK` with body `{"status":"ok"}` |
-| `GET /missing` | `HTTP/1.1 404 Not Found` |
+| `http_parser_tests` | Fragmented headers and bodies; `Content-Length` completion; requests without bodies; case-insensitive header lookup; query/path separation; malformed requests; conflicting lengths; unsupported chunked encoding; header/body size limits |
+| `rate_limiter_tests` | Fake-clock token-bucket burst/refill/cap; zero-rate behavior; independent IP buckets; `429` handler bypass; concurrent same-IP consumption capped at capacity |
+| `metrics_tests` | Connection lifecycle; request/blocked counts; response classes; duration histogram; parse errors; process uptime; log disk-byte gauge |
+| `config_tests` | Config-file parsing; CLI override precedence; invalid-value rejection; unknown-key rejection |
+| `thread_pool_tests` | Fixed worker stats; bounded-queue rejection; rejection after shutdown starts; draining of accepted tasks; continued worker operation after a task throws |
+| `tcp_server_drain_tests` | Three messages appended through API; chronological ordering in `/recent`; `count=1` selects only the newest; JSON escaping; `count=0` and `count=1001` boundary validation; `gateway_log_disk_bytes` in `/metrics`; in-flight handler released after SIGTERM; response delivered before server thread joins; `gateway_thread_pool_workers` present in post-shutdown exposition |
+| `mmap_log_tests` | Append/read across close and reopen; variable and empty payloads; global offsets across segment rollover; exact-fit rollover; oversized-record rejection; incomplete-header/payload recovery; payload bytes before a missing header; active-tail checksum rejection; fatal corruption in a sealed segment |
+| `circular_buffer_tests` | Chronological reads before and after wraparound; exact-capacity fills; zero/oversized reads; capacity-one replacement |
 
-Responses included `Content-Length` and `Connection: close`. These checks show
-that the complete path works for a simple request: socket read, incremental
-parser, router lookup, response serialization, and nonblocking response write.
+---
 
 ## 3. HTTP Integration Test Results
 
-The HTTP feature was tested through the real compiled gateway rather than only
-by calling `HTTPParser` directly. The test uses Python's standard-library
-`socket` module, not `requests`, so it controls the TCP writes and can deliver
-an HTTP request one byte at a time.
+Run with `./scripts/run_http_integration_test.sh`. Docker Compose starts the compiled gateway and a Python `python:3.12-alpine` test container. The gateway's rate-limit override (`--rate-limit-capacity 1000 --rate-limit-refill-rate 0`) prevents the shared container IP from exhausting the token bucket.
 
-### Tests used
-
-The suite in `tests/http_integration_test.py` contains twelve checks:
-
-1. A normal `GET /health` request and response body.
-2. A byte-by-byte `GET /health` request with a small delay between writes.
-3. A fragmented request body with `Content-Length`.
-4. Malformed request lines, HTTP versions, headers, and transfer encoding.
-5. Header-name normalization and repeated headers.
-6. Conflicting `Content-Length` headers.
-7. Header and body size-limit rejection.
-8. Exact routing for valid and unknown method/path pairs.
-9. One hundred concurrent raw-socket HTTP clients.
-10. A slow reader consuming the 512 KiB `/large-response` body in small chunks.
-11. `GET /recent` returns JSON from the in-memory cache; count query tests cover
-	zero, selection of the newest item, malformed values, unknown/repeated
-	parameters, and the configured upper bound.
-12. The `/metrics` endpoint's exposition format, required samples, and scrape
-	counter behavior, including the thread-pool and log-disk gauges.
-
-### How the test was run
-
-Docker Compose built the gateway in one container and ran the Python test in a
-separate `python:3.12-alpine` container. The test container connected to the
-gateway using the Compose service name `gateway`.
-
-The command was:
-
-```bash
-./scripts/run_http_integration_test.sh
-```
-
-The wrapper uses:
-
-```bash
-docker compose -f docker/docker-compose.http-test.yml up \
-  --build \
-  --abort-on-container-exit \
-  --exit-code-from http-test \
-  --remove-orphans
-```
-
-For the fragmented-request cases, the Python client sent individual bytes or
-small request pieces and paused briefly between writes. The server therefore
-had to preserve parser state across multiple readable events and wait until a
-complete request was available.
-
-For the partial-response case, the client requested `GET /large-response`.
-That test-only endpoint returns 512 KiB of deterministic `x` bytes. The client
-used a small receive buffer, read in 1 KiB chunks, paused between reads, and
-verified the complete body and `Content-Length`. This exercised the server's
-outbound buffering and `EPOLLOUT` resume path without assuming how the kernel
-would split individual `send()` calls.
-
-### Observed results
+**Result: 13/13 passed.**
 
 ```text
 PASS test_health_request
@@ -184,384 +67,122 @@ PASS test_concurrent_clients
 PASS test_slow_reader_partial_response
 PASS test_recent_endpoint
 PASS test_metrics_endpoint
-PASS all HTTP integration tests (12)
+PASS test_publish_endpoint
+PASS all HTTP integration tests (13)
 http-test exited with code 0
 ```
 
-The suite was rerun after adding the request pool and persistent storage; the
-latest `./scripts/run_http_integration_test.sh` invocation exited with code 0.
-The cases now also verify `/recent`, pool gauges, and log segment-file bytes.
+The gateway's exit code `137` during Compose teardown is expected (`SIGKILL` from `--abort-on-container-exit`) and is not a test failure.
 
-Docker later stopped the gateway as part of Compose teardown. Its exit code
-`137` is expected in this setup because `--abort-on-container-exit` stops the
-gateway after the test container finishes. The meaningful test result is the
-HTTP test container's exit code `0`.
+### 3.1 What the results demonstrate
 
-### What the results signify
-
-The successful runs demonstrate that the HTTP transport works through the
-real TCP server for normal, fragmented, malformed, concurrent, and
-backpressured traffic. In particular, they show that:
-
-- The parser assembles requests delivered in tiny fragments.
+- The parser assembles requests delivered in tiny TCP fragments.
 - The parser does not route before headers and the declared body are complete.
-- Invalid framing and unsupported protocol features are rejected.
-- Header names and repeated headers follow the implemented rules.
+- Invalid framing and unsupported protocol features (`Transfer-Encoding`, conflicting lengths) are rejected.
+- Header names are normalized; repeated headers follow the implemented rules.
 - Header and body limits are enforced.
 - Exact routing returns the expected success or `404` response.
 - Multiple clients can use the server concurrently without response mixing.
-- A slow reader can still receive a complete large response.
-- The response queue and `EPOLLOUT` path preserve the complete response body.
-- `/metrics` returns Prometheus text with the expected metric samples and
-	content type.
-
-### Metrics endpoint verification
-
-The updated integration test exercises `/metrics` using the same raw-socket
-client as the other endpoint tests. It checks the Prometheus content type and
-required connection, request, parser-error, response-class, duration-histogram,
-uptime, pool worker/busy/queue, and log disk-byte samples. It performs repeated
-scrapes and verifies that the request counter advances between them and that
-the histogram count reflects completed requests.
-
-The endpoint was also checked manually while the gateway was running:
-
-```bash
-curl -i http://localhost:8080/metrics
-```
-
-The first scrape showed one accepted connection and one routed request, with
-zero completed response observations. The next scrape showed two accepted
-connections and two requests, plus one completed `2xx` response and one
-duration observation. This confirms the intentional snapshot timing: request
-and active-connection values include the current scrape, while its response
-class and duration are recorded after its metrics body has been generated and
-appear on the following scrape. The active-connection gauge is `1` during a
-scrape because that client connection is still open while the response is
-being prepared.
-
-This is stronger evidence than the C++ parser tests alone because it includes
-the real socket, epoll loop, connection state, router, response serializer, and
-nonblocking write path.
-
-### Troubleshooting and lessons learned
+- A slow reader receives a complete 512 KiB response through the outbound queue and `EPOLLOUT` path.
+- `/metrics` returns Prometheus text with the expected content type and all required samples; request counters and histogram counts advance correctly across scrapes.
+- `/recent` returns an empty array on a fresh server, validates count parameters, and returns the correct chronological set.
+- `/publish` rejects an empty body with `400`; a non-empty body returns `201 Created` and the record is immediately visible through `/recent`.
 
-The first HTTP integration run after adding the per-IP token-bucket limiter
-exposed an interaction between the security policy and the test suite. The
-Docker test clients all appeared to come from the same container IP, so the
-earlier tests consumed the default 10-token bucket. Later tests then received
-`429 Too Many Requests` even though they were intended to test concurrency and
-response delivery rather than rate limiting.
-
-The first attempted fix was to bind concurrent Python clients to different
-loopback source addresses. That was not portable inside the Alpine Docker
-network namespace: the sockets failed with `EINVAL` because those addresses
-were not assigned there.
-
-The final fix separated the test policies. The production server keeps the
-default policy of a 10-request burst and a 5-request-per-second refill. The
-HTTP integration Compose service now passes explicit CLI overrides:
-
-```bash
---rate-limit-capacity 1000 --rate-limit-refill-rate 0
-```
-
-This prevents unrelated transport tests from exhausting the security bucket.
-The focused C++ rate-limiter tests verify burst behavior, refill, per-IP
-isolation, concurrent same-IP consumption, and that a rejected request returns
-`429` without calling the handler.
+### 3.2 Troubleshooting note — rate limiter vs. integration tests
 
-The lesson is that a test suite must isolate the policy it is trying to
-measure. A failing integration test is not automatically a product bug: it
-may reveal that two valid features are interfering through shared state. We
-kept the production protection intact, removed the Docker-specific networking
-assumption, and made the test configuration explicit.
+The first HTTP integration run after adding per-IP rate limiting failed: all test clients shared the same Docker container IP, so earlier tests consumed the default 10-token bucket. Subsequent tests received `429 Too Many Requests`. Binding clients to different loopback addresses was not portable inside the Alpine network namespace. The final fix was to configure the integration Compose service with a large capacity and zero refill rate. This preserves the production default while making transport-layer tests independent of the rate-limiting policy.
 
-The suite does not yet validate telemetry JSON or `POST /publish`, because that
-application handler has not been implemented. The 50,000-client test below is
-also separate: it validates the historical raw TCP echo path and connection
-retention, not HTTP request processing.
+---
 
-## 4. Connection-Ramp Test
+## 4. Staged HTTP Concurrency Results
 
-The Docker Compose load test uses `scripts/tcp_load_generator.py`. For each
-client, it:
+Run with `python3 scripts/run_backend_tests.py`. The runner sequenced all nine stages. Each stage opened N connections, sent `POST /publish` to N-1 clients and `GET /test/hold` to one, then triggered shutdown and verified recovery.
 
-1. Opens a TCP connection to the gateway.
-2. Sends a known payload.
-3. Verifies that the payload is echoed byte-for-byte.
-4. Keeps the verified connection open for the requested duration.
-5. Reports connection, echo, timeout, and unexpected-close failures.
+### 4.1 Summary table
 
-This is a TCP connection and echo stability test. It does not send HTTP
-requests and therefore does not validate telemetry JSON, HTTP routing, or the
-future `POST /publish` handler.
+| Concurrent clients | Connected | Acknowledged / recovered writes | Avg publish latency | P95 publish latency | Offered req/s | Shutdown |
+| ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| 100 | 100 | 99 / 99 | 2.71 ms | 3.23 ms | 82,520 | Passed |
+| 500 | 500 | 499 / 499 | 19.84 ms | 22.77 ms | 29,644 | Passed |
+| 1,000 | 1,000 | 999 / 999 | 31.68 ms | 34.62 ms | 43,894 | Passed |
+| 2,500 | 2,500 | 2,499 / 2,499 | 65.38 ms | 68.99 ms | 62,879 | Passed |
+| 5,000 | 5,000 | 4,999 / 4,999 | 133.58 ms | 140.51 ms | 62,789 | Passed |
+| 10,000 | 10,000 | 9,999 / 9,999 | 229.27 ms | 248.12 ms | 77,814 | Passed |
+| 20,000 | 20,000 | 19,999 / 19,999 | 437.06 ms | 477.75 ms | 90,154 | Passed |
+| 30,000 | 30,000 | 29,999 / 29,999 | 700.27 ms | 753.07 ms | 87,177 | Passed |
+| 50,000 | 50,000 | 49,999 / 49,999 | 1.605 s | 1.704 s | 53,386 | Passed |
 
-### Command used
+At every stage: zero connect, send, and response-read failures; no `429` or `503` responses; no parse errors.
 
-The one-line command used for the final 50,000-connection run was:
+### 4.2 Resource usage at 50,000 clients
 
-```bash
-CONNECTIONS=50000 DURATION=120 ./scripts/run_load_test.sh
-```
+| Metric | Value |
+| --- | --- |
+| Peak CPU (observed) | 26.55% |
+| Peak RSS (observed) | 212.3 MiB |
+| Pool queue high-water | 88 |
+| Max per-worker completion queue high-water | 42 |
+| Connection-establishment time | 76.4 s |
 
-The same command pattern was used for the other levels by changing
-`CONNECTIONS` and, when needed, `DURATION`, for example:
+### 4.3 Key observations
 
-```bash
-CONNECTIONS=1000 DURATION=30 ./scripts/run_load_test.sh
-```
+- **Connection scaling**: `SO_REUSEPORT` distributed 50,000 clients across 8 workers with coefficient of variation < 1% (6,173–6,347 per worker).
+- **Latency scaling**: average publish latency grew from 2.71 ms at 100 clients to 1.605 s at 50,000, consistent with a burst model where all requests arrive nearly simultaneously.
+- **Shutdown drain**: all 9 stages exited cleanly within 11.2–13.3 s. The deliberate held handler always completed before the 120-second compose-stop timeout.
+- **Persistence**: 100% of acknowledged writes were recovered at every stage. The restarted gateway reached ready state at all 9 stages.
+- **In-flight at shutdown**: only 1 request was in flight at SIGTERM time at every stage (the deliberate hold). Bulk writes had all received their `201 Created` responses before SIGTERM.
 
-The wrapper starts the gateway and load-test containers with Docker Compose,
-rebuilds the gateway image, stops the services after the load test exits, and
-returns the load generator's exit code.
+---
 
-The test environment used a `200000` soft and hard file-descriptor limit for
-the gateway and load generator. The load-test container also used the expanded
-source-port range:
+## 5. Connection-Ramp Test (Historical)
 
-```text
-1024 65535
-```
+This test used the raw TCP echo generator (`scripts/tcp_load_generator.py`) and preceded the HTTP backend test. It verified TCP connection retention, not HTTP request handling.
 
-That setting was necessary because a single load-generator container needs a
-different local ephemeral source port for each simultaneous connection to the
-gateway.
-
-### Detailed validation procedure
-
-The validation was designed as a connection-ramp test rather than a short
-port-open check. The goal was to prove that connections could remain active
-and usable while the gateway continued servicing many other clients.
-
-#### 1. Prepare the gateway
-
-Docker Compose built the gateway image from the current C++ source and started
-the server with:
-
-```text
-./build/message_gateway 8080 65535 0
-```
-
-This configuration means:
-
-- The gateway listened on TCP port `8080`.
-- The kernel listen backlog was set to `65535`.
-- Worker count `0` selected one worker per detected hardware thread.
-- Each worker created its own listener using `SO_REUSEPORT`.
-- The gateway container allowed up to `200000` open file descriptors.
-
-The file-descriptor limit mattered because every listening socket, epoll
-descriptor, and client connection consumes an operating-system file
-descriptor. Without enough descriptors, the test could fail because of the
-test environment instead of the gateway's connection-handling logic.
-
-#### 2. Prepare the load generator
-
-The load generator ran in a separate `python:3.12-alpine` container. It also
-received a `200000` file-descriptor limit and used this local ephemeral source
-port range:
-
-port, destination address, and destination port. Since all clients came from
-one load-generator container and connected to the same gateway endpoint, each
-client needed a different local source port.
-
-The expanded range prevented the client side from becoming the bottleneck.
-
-#### 3. Create the connections
-
-The final run used:
-
-```bash
-CONNECTIONS=50000 DURATION=120 ./scripts/run_load_test.sh
-```
-
-The Python generator created clients sequentially. For each client it:
-
-1. Created an IPv4 TCP socket.
-2. Applied a connection timeout.
-3. Connected to `gateway:8080`.
-4. Sent the known payload:
-
-	 ```text
-	 telemetry-gateway-load-check\n
-	 ```
-
-5. Changed the socket to non-blocking mode.
-6. Kept the socket in a list for later verification.
-
-Connection or send errors were counted as failures, while the generator
-continued attempting the remaining clients. This made the final report show
-how many clients succeeded rather than stopping at the first error.
-
-#### 4. Verify the response from every client
-
-After opening the clients, the generator used Python's `selectors` module to
-monitor all successful sockets. It did not create one Python thread per
-client. Instead, one selector waited for sockets that had response data ready.
-
-For each ready socket, the generator read until it had received the complete
-known payload. It counted a client as failed when:
-
-- The connection could not be created.
-- The payload could not be sent.
-- The server closed the socket unexpectedly.
-- The response differed from the sent payload.
-- The complete response did not arrive within the timeout.
-
-This verified more than the TCP handshake: the server had to accept the
-connection, receive data, process it, queue a response, send the response, and
-keep the connection state valid while thousands of other clients were active.
-
-#### 5. Hold the verified connections open
-
-After all echo responses were verified, the generator kept the successful
-clients open for `120` seconds. During this hold period it monitored the
-sockets for unexpected data or peer closes.
-
-The hold period tested connection retention. A server could accept many
-For each client, the gateway followed this general path:
-
-```text
-accept()
-	-> set client socket non-blocking
-	-> register client with epoll
-	-> read available payload bytes
-	-> append response to the connection buffer
-	-> send immediately or wait for EPOLLOUT
-	-> keep the connection registered during the hold period
-	-> remove, erase, and close after client shutdown
-```
-
-The test therefore exercised:
-
-- TCP accept handling.
-- `SO_REUSEPORT` worker distribution.
-- Per-worker connection maps.
-- Non-blocking `read()` behavior.
-- Level-triggered `epoll` processing.
-- Non-blocking `send()` behavior.
-- Partial-write buffering and `EPOLLOUT`.
-- Connection retention and cleanup.
-
-#### 7. Diagnose and correct the first failed run
-
-The first attempt targeted 50,000 clients but produced:
-
-```text
-28,230 successful
-21,770 failures
-```
-descriptor exhaustion would not interfere with the intended test.
-
-#### 8. Interpret the successful run
-
-The corrected run produced:
-
-```text
-50,000 successful
-0 failures
-153.99 seconds total
-```
-
-The total duration included container startup, client creation, response
-verification, the 120-second hold period, and teardown. It is not a pure
-connection-establishment time and should not be used as an HTTP latency
-measurement.
-
-The result demonstrates that the tested gateway configuration accepted,
-serviced, retained, and cleaned up 50,000 simultaneous TCP clients when both
-the server and the load generator were configured with sufficient resources.
-
-## 5. Recorded Connection Results
-
-The project overview records the following results. The 5,000-connection run
-was also part of the test sequence; its individual elapsed time was not
-recorded in the overview.
-
-| Target connections | Requested hold time | Result | Elapsed time |
+| Target connections | Hold time | Result | Elapsed |
 | ---: | ---: | --- | ---: |
-| 1,000 | 30 seconds | 1,000 successful, 0 failures | 30.14 seconds |
-| 5,000 | Not recorded | Successful, 0 failures | Not recorded |
-| 10,000 | 60 seconds | 10,000 successful, 0 failures | 60.97 seconds |
-| 25,000 | 90 seconds | 25,000 successful, 0 failures | 98.97 seconds |
-| 50,000, first attempt | 120 seconds | 28,230 successful, 21,770 failures | 39.24 seconds |
-| 50,000, corrected run | 120 seconds | 50,000 successful, 0 failures | 153.99 seconds |
+| 1,000 | 30 s | 1,000 successful, 0 failures | 30.14 s |
+| 5,000 | — | Successful, 0 failures | Not recorded |
+| 10,000 | 60 s | 10,000 successful, 0 failures | 60.97 s |
+| 25,000 | 90 s | 25,000 successful, 0 failures | 98.97 s |
+| 50,000 (first) | 120 s | 28,230 successful, 21,770 failures | 39.24 s |
+| 50,000 (corrected) | 120 s | 50,000 successful, 0 failures | 153.99 s |
 
-The final successful run means that 50,000 clients were created, their echo
-payloads were verified, and the successful clients stayed connected for the
-two-minute hold period without load-generator-reported failures.
+The first 50,000-client attempt failed with ~21,770 failures consistent with ephemeral source-port exhaustion on the single load-generator container. Expanding the source port range to 1024–65535 resolved this. The lesson: high-connection tests must configure both sides.
 
-The elapsed time includes container startup, connection creation, echo
-verification, the hold period, and teardown. It should not be interpreted as
-pure connection setup time or as a per-request latency measurement.
+> [!NOTE]
+> The raw TCP test is a connection-retention check, not an HTTP capacity measurement. Results from that test should not be used to infer HTTP throughput.
+
+---
 
 ## 6. Conclusions
 
 ### 6.1 What the results demonstrate
 
-The current eight-test CTest run demonstrates parser and metrics behavior,
-configuration precedence and validation, pool queue bounds and accepted-task
-draining, concurrent same-IP limiter enforcement, SIGTERM response draining,
-log recovery and segment rollover, and circular-cache ordering and boundaries.
-The updated Docker HTTP suite also passed after the pool and storage changes,
-covering recent-message counts and pool/log metrics. The 50,000-client
-connection ramp remains historical evidence from the pre-pool transport.
+| Capability | Evidence |
+| --- | --- |
+| Correct TCP fragmentation handling | HTTP integration test: byte-by-byte and fragmented-body cases |
+| Correct backpressure and partial-write path | HTTP integration test: slow-reader 512 KiB case |
+| Request concurrency without mixing | HTTP integration test: 100 concurrent raw-socket clients |
+| Security policy isolation | Rate-limiter unit tests + integration suite rate-limit override |
+| Configuration correctness | Config unit tests: file/CLI precedence, invalid-value rejection |
+| Pool queue bounding and task draining | Thread-pool unit tests: queue rejection, shutdown drain |
+| Graceful shutdown under in-flight work | `tcp_server_drain_tests` + staged backend test (9 stages) |
+| Persistent log correctness | `mmap_log_tests` (8 cases covering recovery, corruption, rollover) |
+| Cache consistency | `circular_buffer_tests` (4 cases) |
+| HTTP scalability to 50,000 clients | Staged backend test: 9/9 stages, zero failures |
+| Persistence durability across restart | Staged backend test: 9/9 recovery verifications |
+| Worker load distribution | Per-worker metrics (CV < 1% at 50,000 clients) |
 
-The successful ramp from 1,000 through 50,000 connections demonstrates that
-the current network foundation can:
+### 6.2 What the results do not demonstrate
 
-- Build and start reproducibly in a Linux container.
-- Accept large numbers of simultaneous IPv4 TCP connections.
-- Distribute connections across `SO_REUSEPORT` workers.
-- Process readable sockets through the nonblocking `epoll` event loop.
-- Echo data correctly for every verified client.
-- Keep tens of thousands of connections open during a sustained hold period.
-- Handle client cleanup after the load generator closes connections.
+- **Sustained-rate HTTP throughput**: the test is a burst-capacity check; all requests arrive simultaneously after connections are open. Results are not a sustained req/s benchmark.
+- **Many simultaneous blocked handlers**: only one handler was in flight at SIGTERM. Shutdown drain under thousands of blocked application handlers was not tested.
+- **Power-loss durability**: the test uses graceful process shutdown and segment-file recovery. Machine-level crash recovery was not verified.
+- **Multi-host or production network**: all measurements are on a single-host Docker bridge network.
+- **Telemetry JSON validation**: `POST /publish` accepts opaque non-empty bodies. JSON field validation and downstream delivery are not implemented.
+- **Authentication and sustained rate-limit effectiveness**: token-bucket correctness is verified by unit tests; a sustained security-load benchmark under hostile traffic was not run.
+- **Inactive-IP bucket expiration**: the limiter map grows without bound; high-cardinality IP traffic was not tested.
 
-The zero-failure results at 10,000, 25,000, and the corrected 50,000 run give
-useful evidence that the worker ownership model, per-connection state,
-epoll-driven reads, and outbound buffering work together under a large
-connection count.
+### 6.3 Overall assessment
 
-### 6.2 What the first 50,000 failure taught us
-
-The first 50,000-client attempt stopped at about 28,230 successful connections
-with 21,770 failures. This is consistent with ephemeral source-port exhaustion
-on the load generator, rather than a gateway connection limit. It is an
-important operational conclusion: high-connection tests must configure both
-sides. Increasing the gateway's file-descriptor limit alone would not have
-fixed the first run because the client generator could not create enough unique
-local TCP endpoints.
-
-### 6.3 What the results do not demonstrate
-
-The available results do not yet prove:
-
-- HTTP throughput or latency under a dedicated benchmark of the request-pool
-  implementation.
-- Correct telemetry JSON validation.
-- A registered or functioning `POST /publish` application handler.
-- Production rate-limiting effectiveness under sustained HTTP load. Current
-	tests verify token-bucket/concurrent behavior and the integration suite
-	verifies concurrent HTTP clients, but no sustained security-load benchmark
-	has been run.
-- Durable telemetry storage or downstream broadcasting.
-- Durability across sudden power loss; the tests verify close/reopen recovery
-  and malformed-tail recovery, not machine-level crash guarantees.
-- Multi-host load generation or production network performance.
-
-The results validate the historical transport foundation and connection
-scalability, the new C++ storage/pool/configuration behaviors, and end-to-end
-HTTP routing through the updated server. They do not establish dedicated
-pooled-server performance or the complete fleet-monitoring product.
-
-## 7. Overall Result
-
-The project has moved from a basic TCP server to a scalable, event-driven
-transport with an incremental HTTP layer, shared request pool, and segmented
-persistent log. All eight current C++ tests pass, and the updated HTTP
-integration script exited successfully. Historical load results show that the
-earlier networking foundation maintained 50,000 simultaneous TCP clients under
-the recorded test configuration. Dedicated pooled-server performance
-measurements remain future work.
+The gateway has a proven event-driven transport foundation: it accepts, serves, and cleans up tens of thousands of simultaneous HTTP clients, shuts down gracefully while in-flight work completes, and recovers all acknowledged writes from persistent storage across process restart. The next steps — telemetry JSON validation, downstream delivery, authentication, and consumer streaming — build on this validated foundation.

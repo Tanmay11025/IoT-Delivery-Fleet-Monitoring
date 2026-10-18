@@ -140,6 +140,14 @@ add_case_tests(mmap_log_tests
 	mmap_log_fails_on_corruption_in_a_sealed_segment
 )
 
+add_executable(storage_recovery_verify
+	tests/storage_recovery_verify.cpp
+	src/storage/mmap_log.cpp
+)
+target_include_directories(storage_recovery_verify PRIVATE src)
+target_compile_options(storage_recovery_verify PRIVATE -Wall -Wextra -Wpedantic)
+target_link_libraries(storage_recovery_verify PRIVATE Threads::Threads)
+
 add_executable(circular_buffer_tests tests/circular_buffer_test.cpp)
 target_include_directories(circular_buffer_tests PRIVATE src)
 target_compile_options(circular_buffer_tests PRIVATE -Wall -Wextra -Wpedantic)

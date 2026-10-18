@@ -16,6 +16,7 @@ public:
         std::size_t worker_count;
         std::size_t busy_threads;
         std::size_t queue_length;
+        std::size_t queue_high_water;
     };
 
     explicit ThreadPool(std::size_t worker_count, std::size_t queue_capacity)
@@ -45,6 +46,7 @@ public:
             std::lock_guard<std::mutex> lock(mutex);
             if (stopping || tasks.size() >= queue_capacity) return false;
             tasks.push(std::move(task));
+            queue_high_water = std::max(queue_high_water, tasks.size());
         }
         condition.notify_one();
         return true;
@@ -66,7 +68,8 @@ public:
 
     Stats stats() const {
         std::lock_guard<std::mutex> lock(mutex);
-        return {workers.size(), busy_threads.load(std::memory_order_relaxed), tasks.size()};
+        return {workers.size(), busy_threads.load(std::memory_order_relaxed), tasks.size(),
+            queue_high_water};
     }
 
 private:
@@ -93,6 +96,7 @@ private:
     mutable std::mutex mutex;
     std::condition_variable condition;
     std::queue<std::function<void()>> tasks;
+    std::size_t queue_high_water = 0;
     std::vector<std::thread> workers;
     std::atomic<std::size_t> busy_threads{0};
     bool stopping = false;
