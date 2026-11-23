@@ -14,6 +14,10 @@ add_executable(message_gateway
 	src/http/http_parser.cpp
 	src/http/http_response.cpp
 	src/http/router.cpp
+	src/http/static_files.cpp
+	src/protocol/frame_codec.cpp
+	src/telemetry/telemetry_event.cpp
+	src/telemetry/fleet_state.cpp
 	src/security/rate_limiter.cpp
 	src/storage/mmap_log.cpp
 	src/monitoring/metrics.cpp
@@ -77,6 +81,7 @@ add_executable(metrics_tests
 target_include_directories(metrics_tests PRIVATE src)
 target_compile_options(metrics_tests PRIVATE -Wall -Wextra -Wpedantic)
 add_case_tests(metrics_tests
+	metrics_track_telemetry_vehicles_and_consumers
 	metrics_track_connection_lifecycle
 	metrics_track_requests_responses_and_duration
 	metrics_track_parse_errors_and_uptime
@@ -89,6 +94,7 @@ add_executable(config_tests
 target_include_directories(config_tests PRIVATE src)
 target_compile_options(config_tests PRIVATE -Wall -Wextra -Wpedantic)
 add_case_tests(config_tests
+	config_reads_fleet_and_consumer_settings
 	config_reads_file_and_cli_overrides
 	config_rejects_invalid_values_and_unknown_keys
 )
@@ -105,6 +111,9 @@ add_case_tests(thread_pool_tests
 add_executable(tcp_server_drain_tests
 	tests/tcp_server_drain_test.cpp
 	src/core/config.cpp
+	src/protocol/frame_codec.cpp
+	src/telemetry/telemetry_event.cpp
+	src/telemetry/fleet_state.cpp
 	src/storage/mmap_log.cpp
 	src/http/http_parser.cpp
 	src/http/http_response.cpp

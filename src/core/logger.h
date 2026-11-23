@@ -28,16 +28,20 @@ class Logger {
 
         // Static method allows calling Logger::info() without instantiating the class.
         // Outputs timestamped INFO-level messages with the format: [timestamp] [INFO] message
-        static void info(const string& message) {
+        static void info(const string& message) { write("INFO", message); }
+        static void warn(const string& message) { write("WARN", message); }
+        static void error(const string& message) { write("ERROR", message); }
+
+    private:
+        static void write(const char* level, const string& message) {
             lock_guard<mutex> lock(output_mutex());
             auto now = chrono::system_clock::now();
             auto time = chrono::system_clock::to_time_t(now);
             ostream& output = log_file().is_open() ? static_cast<ostream&>(log_file()) : cout;
-            output << "[" << ctime(&time) << "] [INFO] " << message << '\n';
+            output << "[" << ctime(&time) << "] [" << level << "] " << message << '\n';
             output.flush();
         }
 
-    private:
         static mutex& output_mutex() {
             static mutex mutex_instance;
             return mutex_instance;

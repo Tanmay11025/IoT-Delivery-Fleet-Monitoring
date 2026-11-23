@@ -70,6 +70,30 @@ void Metrics::parse_error() {
     parse_errors.fetch_add(1, std::memory_order_relaxed);
 }
 
+void Metrics::telemetry_accepted() {
+    telemetry_events.fetch_add(1, std::memory_order_relaxed);
+}
+
+void Metrics::telemetry_rejected() {
+    telemetry_rejections.fetch_add(1, std::memory_order_relaxed);
+}
+
+void Metrics::consumer_connected() {
+    open_consumers.fetch_add(1, std::memory_order_relaxed);
+}
+
+void Metrics::consumer_disconnected() {
+    open_consumers.fetch_sub(1, std::memory_order_relaxed);
+}
+
+void Metrics::consumer_records_sent(std::uint64_t count) {
+    consumer_records.fetch_add(count, std::memory_order_relaxed);
+}
+
+std::size_t Metrics::consumers_connected() const {
+    return open_consumers.load(std::memory_order_relaxed);
+}
+
 std::size_t Metrics::active_connections() const {
     return open_connections.load(std::memory_order_relaxed);
 }
@@ -78,7 +102,8 @@ std::string Metrics::prometheus_text(std::size_t pool_workers,
                                      std::size_t busy_threads,
                                      std::size_t queue_length,
                                      std::uint64_t log_disk_bytes,
-                                     std::size_t queue_high_water) const {
+                                     std::size_t queue_high_water,
+                                     const FleetGauges& fleet) const {
     std::ostringstream output;
     output << std::setprecision(9);
     output << "# HELP gateway_connections_active Current open client connections.\n"
@@ -147,6 +172,43 @@ std::string Metrics::prometheus_text(std::size_t pool_workers,
                << "# HELP gateway_log_disk_bytes Provisioned bytes across pre-sized log segment files.\n"
                << "# TYPE gateway_log_disk_bytes gauge\n"
                << "gateway_log_disk_bytes " << log_disk_bytes << '\n';
+    output << "# HELP gateway_telemetry_events_total Telemetry events validated and "
+              "appended to the log.\n"
+           << "# TYPE gateway_telemetry_events_total counter\n"
+           << "gateway_telemetry_events_total "
+           << telemetry_events.load(std::memory_order_relaxed) << '\n'
+           << "# HELP gateway_telemetry_rejected_total Publish requests rejected by "
+              "telemetry validation.\n"
+           << "# TYPE gateway_telemetry_rejected_total counter\n"
+           << "gateway_telemetry_rejected_total "
+           << telemetry_rejections.load(std::memory_order_relaxed) << '\n'
+           << "# HELP gateway_active_vehicles Vehicles that reported within the offline "
+              "window.\n"
+           << "# TYPE gateway_active_vehicles gauge\n"
+           << "gateway_active_vehicles " << fleet.vehicles_active << '\n'
+           << "# HELP gateway_vehicles Known vehicles by effective status.\n"
+           << "# TYPE gateway_vehicles gauge\n"
+           << "gateway_vehicles{status=\"moving\"} " << fleet.vehicles_moving << '\n'
+           << "gateway_vehicles{status=\"idle\"} " << fleet.vehicles_idle << '\n'
+           << "gateway_vehicles{status=\"offline\"} " << fleet.vehicles_offline << '\n'
+           << "# HELP gateway_log_end_offset Offset that the next appended record will "
+              "receive.\n"
+           << "# TYPE gateway_log_end_offset gauge\n"
+           << "gateway_log_end_offset " << fleet.log_end_offset << '\n'
+           << "# HELP gateway_consumers_connected Open binary-protocol consumer "
+              "connections.\n"
+           << "# TYPE gateway_consumers_connected gauge\n"
+           << "gateway_consumers_connected "
+           << open_consumers.load(std::memory_order_relaxed) << '\n'
+           << "# HELP gateway_consumer_records_sent_total DATA frames queued to "
+              "consumers.\n"
+           << "# TYPE gateway_consumer_records_sent_total counter\n"
+           << "gateway_consumer_records_sent_total "
+           << consumer_records.load(std::memory_order_relaxed) << '\n'
+           << "# HELP gateway_consumer_lag_bytes Sum over consumers of log end offset "
+              "minus acknowledged offset.\n"
+           << "# TYPE gateway_consumer_lag_bytes gauge\n"
+           << "gateway_consumer_lag_bytes " << fleet.consumer_lag_bytes << '\n';
     const std::size_t worker_count = epoll_worker_count.load(std::memory_order_relaxed);
     for (std::size_t worker_id = 0; worker_id < worker_count; ++worker_id) {
         const auto& worker = epoll_workers[worker_id];

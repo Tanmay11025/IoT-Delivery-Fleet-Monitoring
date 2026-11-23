@@ -1,32 +1,19 @@
 #include "tcp_server.h"
 
+#include "../core/json_util.h"
+#include "../telemetry/telemetry_event.h"
+
 #include <charconv>
 #include <sys/eventfd.h>
 
 namespace {
-std::string json_escape(const std::string& value) {
-    static constexpr char hex[] = "0123456789abcdef";
-    std::string escaped;
-    for (const unsigned char byte : value) {
-        switch (byte) {
-        case '"': escaped += "\\\""; break;
-        case '\\': escaped += "\\\\"; break;
-        case '\b': escaped += "\\b"; break;
-        case '\f': escaped += "\\f"; break;
-        case '\n': escaped += "\\n"; break;
-        case '\r': escaped += "\\r"; break;
-        case '\t': escaped += "\\t"; break;
-        default:
-            if (byte < 0x20) {
-                escaped += "\\u00";
-                escaped += hex[byte >> 4];
-                escaped += hex[byte & 0x0f];
-            } else {
-                escaped += static_cast<char>(byte);
-            }
-        }
-    }
-    return escaped;
+// Wake an epoll worker blocked in epoll_wait().
+void signal_eventfd(int fd) {
+    const std::uint64_t notification = 1;
+    ssize_t result;
+    do {
+        result = write(fd, &notification, sizeof(notification));
+    } while (result == -1 && errno == EINTR);
 }
 }
 
@@ -112,6 +99,7 @@ TCPServer::TCPServer(Config config)
             epoll_worker_count(this->config.epoll_worker_count == 0
                                                          ? max(1u, thread::hardware_concurrency())
                                                          : this->config.epoll_worker_count),
+            fleet_state(chrono::seconds(this->config.vehicle_offline_seconds)),
             router(this->config.rate_limit_capacity, this->config.rate_limit_refill_rate) {
         this->config.validate();
 }
@@ -136,6 +124,7 @@ bool TCPServer::start() {
         cerr << "Unable to open persistent log: " << exception.what() << '\n';
         return false;
     }
+    rebuild_fleet_state();
     try {
         thread_pool = make_unique<ThreadPool>(config.thread_pool_size,
                                               config.task_queue_capacity);
@@ -165,6 +154,111 @@ bool TCPServer::start() {
     thread_pool->join();
 
     return !worker_failed.load(memory_order_relaxed);
+}
+
+void TCPServer::rebuild_fleet_state() {
+    // The recent cache was refilled by log recovery, so the last N records are
+    // available without another disk scan. Records written before validation
+    // existed (or by tests) are simply skipped.
+    const auto now_ns = static_cast<std::uint64_t>(
+        chrono::duration_cast<chrono::nanoseconds>(
+            chrono::system_clock::now().time_since_epoch()).count());
+    std::size_t restored = 0;
+    for (const Message& message : storage_log.get_recent(config.recent_message_capacity)) {
+        const TelemetryParseResult parsed = parse_telemetry(message.payload);
+        if (!parsed.ok) continue;
+        const std::uint64_t age_ns =
+            now_ns > message.timestamp_ns ? now_ns - message.timestamp_ns : 0;
+        fleet_state.update(parsed.event, message.offset, chrono::nanoseconds(age_ns));
+        ++restored;
+    }
+    if (restored != 0) {
+        Logger::info("Restored fleet state from " + to_string(restored) + " recent records");
+    }
+}
+
+std::uint64_t TCPServer::append_message(const std::string& payload) {
+    const std::uint64_t offset = storage_log.append(payload);
+    notify_consumers();
+    return offset;
+}
+
+void TCPServer::notify_consumers() {
+    lock_guard<mutex> lock(loop_states_mutex);
+    for (LoopState* state : loop_states) {
+        if (state->consumer_count.load(memory_order_relaxed) == 0) continue;
+        // Only the first publisher after a drain pays for the eventfd write.
+        if (!state->data_available.exchange(true, memory_order_acq_rel)) {
+            signal_eventfd(state->completion_fd);
+        }
+    }
+}
+
+HttpResponse TCPServer::publish_telemetry(const HttpRequest& request) {
+    const TelemetryParseResult parsed = parse_telemetry(request.body);
+    if (!parsed.ok) {
+        metrics.telemetry_rejected();
+        return HttpResponse{400, "Bad Request", {{"Content-Type", "application/json"}},
+                            "{\"error\":\"" + json_escape(parsed.error) + "\"}"};
+    }
+    const std::uint64_t offset = append_message(request.body);
+    fleet_state.update(parsed.event, offset);
+    metrics.telemetry_accepted();
+    return HttpResponse{201, "Created", {{"Content-Type", "application/json"}},
+                        "{\"offset\":" + std::to_string(offset) + "}"};
+}
+
+string TCPServer::metrics_text() const {
+    const auto stats = thread_pool ? thread_pool->stats() : ThreadPool::Stats{0, 0, 0, 0};
+    const FleetState::Counts counts = fleet_state.counts();
+    FleetGauges fleet;
+    fleet.vehicles_total = counts.total;
+    fleet.vehicles_active = counts.active();
+    fleet.vehicles_moving = counts.moving;
+    fleet.vehicles_idle = counts.idle;
+    fleet.vehicles_offline = counts.offline;
+    fleet.log_end_offset = storage_log.next_offset();
+    {
+        lock_guard<mutex> lock(consumer_registry_mutex);
+        for (const auto& entry : consumer_registry) {
+            if (!entry.second.streaming) continue;
+            if (fleet.log_end_offset > entry.second.acked) {
+                fleet.consumer_lag_bytes += fleet.log_end_offset - entry.second.acked;
+            }
+        }
+    }
+    return metrics.prometheus_text(stats.worker_count, stats.busy_threads,
+                                   stats.queue_length, storage_log.disk_usage_bytes(),
+                                   stats.queue_high_water, fleet);
+}
+
+std::string TCPServer::consumers_json() const {
+    const std::uint64_t end = storage_log.next_offset();
+    const auto now = chrono::steady_clock::now();
+    std::vector<std::pair<std::uint64_t, ConsumerInfo>> consumers;
+    {
+        lock_guard<mutex> lock(consumer_registry_mutex);
+        consumers.assign(consumer_registry.begin(), consumer_registry.end());
+    }
+    std::sort(consumers.begin(), consumers.end(),
+              [](const auto& left, const auto& right) { return left.first < right.first; });
+    std::string json = "{\"log_end_offset\":" + std::to_string(end) + ",\"consumers\":[";
+    bool first = true;
+    for (const auto& [id, info] : consumers) {
+        if (!first) json += ',';
+        first = false;
+        const chrono::duration<double> connected = now - info.connected_at;
+        const std::uint64_t lag = info.streaming && end > info.acked ? end - info.acked : 0;
+        json += "{\"id\":" + std::to_string(id) +
+                ",\"client_ip\":\"" + json_escape(info.client_ip) + "\"" +
+                ",\"streaming\":" + (info.streaming ? "true" : "false") +
+                ",\"cursor\":" + std::to_string(info.cursor) +
+                ",\"acked\":" + std::to_string(info.acked) +
+                ",\"lag_bytes\":" + std::to_string(lag) +
+                ",\"connected_seconds\":" + json_number(connected.count(), 1) + "}";
+    }
+    json += "]}";
+    return json;
 }
 
 std::string TCPServer::recent_messages_json(std::size_t count) const {
@@ -242,9 +336,31 @@ void TCPServer::worker_loop(unsigned int worker_id) {
         shutdown_requested.store(true, memory_order_relaxed);
         return;
     }
+    if (config.consumer_port != 0) {
+        // Every worker also owns a reuse-port listener for binary consumers,
+        // so consumers are spread across workers exactly like HTTP clients.
+        state.consumer_listener_fd = create_reuseport_listener(config.consumer_port,
+                                                               config.backlog);
+        if (state.consumer_listener_fd == -1 ||
+            !loop.add_fd(state.consumer_listener_fd, EPOLLIN)) {
+            if (state.consumer_listener_fd != -1) close(state.consumer_listener_fd);
+            close(state.completion_fd);
+            close(listener_fd);
+            worker_failed.store(true, memory_order_relaxed);
+            shutdown_requested.store(true, memory_order_relaxed);
+            return;
+        }
+    }
+    {
+        lock_guard<mutex> lock(loop_states_mutex);
+        loop_states.push_back(&state);
+    }
 
     Logger::info("Epoll worker " + to_string(worker_id) + " listening on port " +
-                 to_string(config.port) + " with backlog " + to_string(config.backlog));
+                 to_string(config.port) + " with backlog " + to_string(config.backlog) +
+                 (config.consumer_port != 0
+                      ? ", consumers on port " + to_string(config.consumer_port)
+                      : string()));
     const bool loop_completed = loop.run(
         [this, &loop, &connections, &state, &listener_fd](int fd, unsigned int events) {
             handle_event(loop, connections, state, listener_fd, fd, events);
@@ -258,10 +374,18 @@ void TCPServer::worker_loop(unsigned int worker_id) {
                 for (const int fd : connections.file_descriptors()) {
                     Connection* connection = connections.get(fd);
                     if (connection == nullptr || connection->request_in_flight) continue;
-                    if (connection->pending_bytes() != 0) flush_client(loop, connections, fd);
-                    else close_client(loop, connections, fd);
+                    // Consumers hold no in-flight work; their position is
+                    // their acked offset, so they can simply reconnect.
+                    if (connection->kind == ConnectionKind::Consumer) {
+                        close_client(loop, connections, fd);
+                    } else if (connection->pending_bytes() != 0) {
+                        flush_client(loop, connections, fd);
+                    } else {
+                        close_client(loop, connections, fd);
+                    }
                 }
             }
+            state.consumer_count.store(connections.consumer_count(), memory_order_relaxed);
         },
         [&connections, &state] {
             return state.draining && state.outstanding_tasks.load(std::memory_order_relaxed) == 0 &&
@@ -271,7 +395,16 @@ void TCPServer::worker_loop(unsigned int worker_id) {
         worker_failed.store(true, memory_order_relaxed);
         shutdown_requested.store(true, memory_order_relaxed);
     }
+    {
+        // Unregister before `state` goes out of scope so publishers never
+        // touch a destroyed LoopState or a closed eventfd.
+        lock_guard<mutex> lock(loop_states_mutex);
+        loop_states.erase(std::remove(loop_states.begin(), loop_states.end(), &state),
+                          loop_states.end());
+    }
+    for (const int fd : connections.file_descriptors()) close_client(loop, connections, fd);
     if (listener_fd != -1) close(listener_fd);
+    if (state.consumer_listener_fd != -1) close(state.consumer_listener_fd);
     close(state.completion_fd);
 }
 
@@ -287,7 +420,23 @@ void TCPServer::handle_event(EpollLoop& loop, ConnectionManager& connections,
         return;
     }
 
+    if (fd == state.consumer_listener_fd) {
+        if (state.draining) return;
+        if (events & (EPOLLERR | EPOLLHUP)) {
+            worker_failed.store(true, memory_order_relaxed);
+            shutdown_requested.store(true, memory_order_relaxed);
+            return;
+        }
+        if (events & EPOLLIN) accept_consumers(loop, connections, state);
+        return;
+    }
+
     if (fd != listener_fd && connections.get(fd) == nullptr) return;
+
+    if (fd != listener_fd && connections.get(fd)->kind == ConnectionKind::Consumer) {
+        handle_consumer_event(loop, connections, state, fd, events);
+        return;
+    }
 
     if (fd == listener_fd) {
         if (state.draining) return;
@@ -507,6 +656,14 @@ void TCPServer::process_completions(EpollLoop& loop, ConnectionManager& connecti
         }
         state.outstanding_tasks.fetch_sub(1, memory_order_relaxed);
     }
+
+    // Clear the flag before reading the log end, so a record appended while
+    // we pump sets it again and triggers another wake-up instead of being missed.
+    if (state.data_available.exchange(false, memory_order_acq_rel)) {
+        for (const int fd : connections.consumer_file_descriptors()) {
+            pump_consumer(loop, connections, state, fd);
+        }
+    }
 }
 
 void TCPServer::begin_drain(EpollLoop& loop, ConnectionManager& connections,
@@ -519,10 +676,16 @@ void TCPServer::begin_drain(EpollLoop& loop, ConnectionManager& connections,
         close(listener_fd);
         listener_fd = -1;
     }
+    if (state.consumer_listener_fd != -1) {
+        loop.remove_fd(state.consumer_listener_fd);
+        close(state.consumer_listener_fd);
+        state.consumer_listener_fd = -1;
+    }
     for (const int fd : connections.file_descriptors()) {
         Connection* connection = connections.get(fd);
         if (connection == nullptr || connection->request_in_flight) continue;
-        if (connection->pending_bytes() != 0) flush_client(loop, connections, fd);
+        if (connection->kind == ConnectionKind::Consumer) close_client(loop, connections, fd);
+        else if (connection->pending_bytes() != 0) flush_client(loop, connections, fd);
         else close_client(loop, connections, fd);
     }
 }
@@ -579,11 +742,231 @@ bool TCPServer::flush_client(EpollLoop& loop, ConnectionManager& connections, in
 
 void TCPServer::close_client(EpollLoop& loop, ConnectionManager& connections, int client_fd) {
     loop.remove_fd(client_fd);
-    if (connections.get(client_fd) != nullptr) {
+    if (Connection* connection = connections.get(client_fd)) {
+        if (connection->kind == ConnectionKind::Consumer) {
+            {
+                lock_guard<mutex> lock(consumer_registry_mutex);
+                consumer_registry.erase(connection->consumer_id);
+            }
+            consumer_total.fetch_sub(1, memory_order_relaxed);
+            metrics.consumer_disconnected();
+        } else {
+            metrics.connection_closed();
+        }
         connections.remove(client_fd);
-        metrics.connection_closed();
     }
     close(client_fd);
+}
+
+void TCPServer::accept_consumers(EpollLoop& loop, ConnectionManager& connections,
+                                 LoopState& state) {
+    while (true) {
+        sockaddr_in client_addr{};
+        socklen_t client_addr_len = sizeof(client_addr);
+        const int client_fd = accept(state.consumer_listener_fd,
+                                     reinterpret_cast<sockaddr*>(&client_addr),
+                                     &client_addr_len);
+        if (client_fd == -1) {
+            if (errno == EINTR) continue;
+            if (errno != EAGAIN && errno != EWOULDBLOCK) perror("accept consumer");
+            return;
+        }
+
+        // Reserve a slot first so concurrent workers cannot overshoot the cap.
+        if (consumer_total.fetch_add(1, memory_order_relaxed) >= config.max_consumers) {
+            consumer_total.fetch_sub(1, memory_order_relaxed);
+            // Best effort: the socket is still blocking, and the frame is tiny.
+            const std::string error = encode_error("too many consumers");
+            (void)send(client_fd, error.data(), error.size(), MSG_NOSIGNAL | MSG_DONTWAIT);
+            close(client_fd);
+            continue;
+        }
+
+        char client_ip[INET_ADDRSTRLEN]{};
+        if (inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, sizeof(client_ip)) == nullptr ||
+            !set_nonblocking(client_fd) || !loop.add_fd(client_fd, EPOLLIN | EPOLLRDHUP)) {
+            consumer_total.fetch_sub(1, memory_order_relaxed);
+            close(client_fd);
+            continue;
+        }
+
+        connections.add(client_fd, client_ip, state.next_generation++, ConnectionKind::Consumer);
+        Connection* connection = connections.get(client_fd);
+        connection->consumer_id = next_consumer_id.fetch_add(1, memory_order_relaxed);
+        {
+            lock_guard<mutex> lock(consumer_registry_mutex);
+            consumer_registry[connection->consumer_id] =
+                ConsumerInfo{client_ip, false, 0, 0, chrono::steady_clock::now()};
+        }
+        state.consumer_count.store(connections.consumer_count(), memory_order_relaxed);
+        metrics.consumer_connected();
+    }
+}
+
+void TCPServer::handle_consumer_event(EpollLoop& loop, ConnectionManager& connections,
+                                      LoopState& state, int fd, unsigned int events) {
+    if (events & (EPOLLERR | EPOLLHUP)) {
+        close_client(loop, connections, fd);
+        return;
+    }
+
+    if (events & EPOLLIN) {
+        char buffer[4096];
+        while (true) {
+            const ssize_t bytes_read = read(fd, buffer, sizeof(buffer));
+            if (bytes_read == 0) {
+                // The consumer went away; anything still queued is undeliverable.
+                close_client(loop, connections, fd);
+                return;
+            }
+            if (bytes_read == -1) {
+                if (errno == EINTR) continue;
+                if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+                close_client(loop, connections, fd);
+                return;
+            }
+            Connection* connection = connections.get(fd);
+            connection->frames.feed(std::string_view(buffer, static_cast<size_t>(bytes_read)));
+            while (auto frame = connection->frames.next()) {
+                handle_consumer_frame(loop, connections, fd, *frame);
+                connection = connections.get(fd);
+                if (connection == nullptr) return;
+                if (connection->peer_closed) break;  // An error frame is queued.
+            }
+            if (connection->frames.failed()) {
+                fail_consumer(loop, connections, fd, connection->frames.error());
+                return;
+            }
+            if (connection->peer_closed) break;
+        }
+    }
+
+    if (events & EPOLLRDHUP) {
+        close_client(loop, connections, fd);
+        return;
+    }
+
+    if (events & EPOLLOUT) {
+        if (!flush_client(loop, connections, fd)) return;
+    }
+    pump_consumer(loop, connections, state, fd);
+}
+
+void TCPServer::handle_consumer_frame(EpollLoop& loop, ConnectionManager& connections,
+                                      int fd, const Frame& frame) {
+    Connection* connection = connections.get(fd);
+    switch (frame.type) {
+    case FrameType::Subscribe:
+        if (connection->streaming) return fail_consumer(loop, connections, fd, "already streaming");
+        if (!frame.payload.empty()) {
+            return fail_consumer(loop, connections, fd, "SUBSCRIBE takes no payload");
+        }
+        connection->cursor = storage_log.next_offset();
+        connection->acked = connection->cursor;
+        connection->streaming = true;
+        break;
+    case FrameType::FetchFrom: {
+        if (connection->streaming) return fail_consumer(loop, connections, fd, "already streaming");
+        const auto offset = read_offset_payload(frame);
+        if (!offset) return fail_consumer(loop, connections, fd, "FETCH_FROM needs a u64 offset");
+        if (*offset > storage_log.next_offset()) {
+            return fail_consumer(loop, connections, fd, "offset is beyond the end of the log");
+        }
+        // Whether the offset is a record boundary is checked on the first read.
+        connection->cursor = *offset;
+        connection->acked = *offset;
+        connection->streaming = true;
+        break;
+    }
+    case FrameType::Ack: {
+        const auto offset = read_offset_payload(frame);
+        if (!offset || !connection->streaming) {
+            return fail_consumer(loop, connections, fd, "unexpected ACK");
+        }
+        if (*offset > connection->cursor) {
+            return fail_consumer(loop, connections, fd, "ACK is ahead of delivered data");
+        }
+        if (*offset > connection->acked) connection->acked = *offset;
+        break;
+    }
+    case FrameType::Data:
+    case FrameType::Error:
+        return fail_consumer(loop, connections, fd, "unexpected frame from consumer");
+    }
+    record_consumer(*connection);
+}
+
+void TCPServer::pump_consumer(EpollLoop& loop, ConnectionManager& connections,
+                              const LoopState& state, int fd) {
+    Connection* connection = connections.get(fd);
+    if (connection == nullptr || !connection->streaming || connection->peer_closed ||
+        state.draining) {
+        return;
+    }
+
+    const std::uint64_t end = storage_log.next_offset();
+    while (connection->cursor < end) {
+        // Reclaim the already-sent prefix so a long-lived stream that never
+        // fully drains cannot grow its buffer forever.
+        if (connection->outbound_offset > 0 &&
+            connection->outbound_offset * 2 >= connection->outbound.size()) {
+            connection->outbound.erase(0, connection->outbound_offset);
+            connection->outbound_offset = 0;
+        }
+
+        // Backpressure: stop refilling once enough is queued.
+        std::uint64_t sent = 0;
+        while (connection->pending_bytes() < consumer_high_water_bytes &&
+               connection->cursor < end) {
+            LogReadResult batch;
+            try {
+                batch = storage_log.read_from(connection->cursor, consumer_read_batch_bytes);
+            } catch (const std::invalid_argument&) {
+                return fail_consumer(loop, connections, fd, "offset is not a record boundary");
+            } catch (const std::exception& error) {
+                Logger::error(std::string("consumer read failed: ") + error.what());
+                return fail_consumer(loop, connections, fd, "log read failed");
+            }
+            if (batch.messages.empty()) break;
+            for (const Message& message : batch.messages) {
+                const std::uint64_t next = message.offset + MemoryMappedLog::record_header_size +
+                                           message.payload_length;
+                connection->outbound += encode_data(message.offset, next, message.timestamp_ns,
+                                                    message.payload);
+            }
+            sent += batch.messages.size();
+            connection->cursor = batch.next_offset;
+        }
+        if (sent == 0) return;
+        metrics.consumer_records_sent(sent);
+        record_consumer(*connection);
+
+        if (!flush_client(loop, connections, fd)) return;  // Socket was closed.
+        connection = connections.get(fd);
+        if (connection == nullptr) return;
+        // The kernel buffer is full; EPOLLOUT will call us again.
+        if (connection->pending_bytes() != 0) return;
+    }
+}
+
+void TCPServer::fail_consumer(EpollLoop& loop, ConnectionManager& connections, int fd,
+                              const std::string& message) {
+    Connection* connection = connections.get(fd);
+    if (connection == nullptr) return;
+    connection->streaming = false;
+    connection->outbound += encode_error(message);
+    // flush_client closes the socket once the ERROR frame has been written.
+    connection->peer_closed = true;
+    flush_client(loop, connections, fd);
+}
+
+void TCPServer::record_consumer(const Connection& connection) {
+    lock_guard<mutex> lock(consumer_registry_mutex);
+    auto found = consumer_registry.find(connection.consumer_id);
+    if (found == consumer_registry.end()) return;
+    found->second.streaming = connection.streaming;
+    found->second.cursor = connection.cursor;
+    found->second.acked = connection.acked;
 }
 
 void TCPServer::stop() {

@@ -64,6 +64,7 @@ std::string send_request(int port, const std::string& path) {
 void shutdown_drains_an_in_flight_handler() {
     Config config;
     config.port = reserve_port();
+    config.consumer_port = 0;  // Not under test; avoid binding the default 9090.
     config.epoll_worker_count = 1;
     config.thread_pool_size = 1;
     config.task_queue_capacity = 2;

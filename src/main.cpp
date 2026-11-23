@@ -1,4 +1,5 @@
 #include "network/tcp_server.h"
+#include "http/static_files.h"
 
 #include <chrono>
 #include <cstdlib>
@@ -16,7 +17,8 @@ int main(int argc, char* argv[]) {
                 " [--pool-threads n] [--queue-capacity n] [--log-path path]"
                      " [--rate-limit-capacity n] [--rate-limit-refill-rate n]"
                      " [--storage-directory path] [--storage-segment-size bytes]"
-                     " [--recent-capacity n]\n";
+                     " [--recent-capacity n] [--consumer-port n] [--max-consumers n]"
+                     " [--dashboard-directory path] [--vehicle-offline-seconds n]\n";
         return EXIT_FAILURE;
     }
 
@@ -42,12 +44,32 @@ int main(int argc, char* argv[]) {
         return server.recent_messages_response(request);
     });
     server.add_route("POST", "/publish", [&server](const HttpRequest& request) {
-        if (request.body.empty()) {
-            return HttpResponse{400, "Bad Request", {}, "Request body is required"};
-        }
-        const std::uint64_t offset = server.append_message(request.body);
-        return HttpResponse{201, "Created", {}, std::to_string(offset)};
+        return server.publish_telemetry(request);
     });
+    server.add_route("GET", "/vehicles", [&server](const HttpRequest&) {
+        return HttpResponse{200, "OK", {{"Content-Type", "application/json"}},
+                            server.vehicles_json()};
+    });
+    server.add_route("GET", "/consumers", [&server](const HttpRequest&) {
+        return HttpResponse{200, "OK", {{"Content-Type", "application/json"}},
+                            server.consumers_json()};
+    });
+
+    std::vector<std::string> missing_assets;
+    const auto dashboard_files = load_dashboard_files(config.dashboard_directory, missing_assets);
+    for (const StaticFile& file : dashboard_files) {
+        server.add_route("GET", file.url_path, [file](const HttpRequest&) {
+            return HttpResponse{200, "OK",
+                                {{"Content-Type", file.content_type},
+                                 {"Cache-Control", "no-cache"}},
+                                file.body};
+        });
+    }
+    if (!missing_assets.empty()) {
+        Logger::warn("Dashboard directory '" + config.dashboard_directory + "' is missing " +
+                     std::to_string(missing_assets.size()) + " file(s); the dashboard may be "
+                     "incomplete. Set dashboard_directory or --dashboard-directory.");
+    }
     server.add_route("GET", "/large-response", [](const HttpRequest&) {
         // This deterministic payload exercises queued output and EPOLLOUT tests.
         return HttpResponse{200, "OK", {}, string(512 * 1024, 'x')};

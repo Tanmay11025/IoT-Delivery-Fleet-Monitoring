@@ -39,6 +39,10 @@ void apply(Config& config, const std::string& key, const std::string& value) {
     else if (key == "storage_directory") config.storage_directory = value;
     else if (key == "storage_segment_size") config.storage_segment_size = parse_number<std::uint64_t>(value, key);
     else if (key == "recent_message_capacity") config.recent_message_capacity = parse_number<std::size_t>(value, key);
+    else if (key == "consumer_port") config.consumer_port = parse_number<int>(value, key);
+    else if (key == "max_consumers") config.max_consumers = parse_number<std::size_t>(value, key);
+    else if (key == "dashboard_directory") config.dashboard_directory = value;
+    else if (key == "vehicle_offline_seconds") config.vehicle_offline_seconds = parse_number<unsigned int>(value, key);
     else throw std::runtime_error("Unknown configuration key: " + key);
 }
 
@@ -54,6 +58,10 @@ const std::unordered_map<std::string, std::string> options{
     {"--storage-directory", "storage_directory"},
     {"--storage-segment-size", "storage_segment_size"},
     {"--recent-capacity", "recent_message_capacity"},
+    {"--consumer-port", "consumer_port"},
+    {"--max-consumers", "max_consumers"},
+    {"--dashboard-directory", "dashboard_directory"},
+    {"--vehicle-offline-seconds", "vehicle_offline_seconds"},
 };
 }
 
@@ -139,5 +147,15 @@ void Config::validate() const {
     }
     if (recent_message_capacity == 0 || recent_message_capacity > (1U << 20)) {
         throw std::runtime_error("recent_message_capacity must be between 1 and 1048576");
+    }
+    if (consumer_port < 0 || consumer_port > 65535) {
+        throw std::runtime_error("consumer_port must be 0 (disabled) or between 1 and 65535");
+    }
+    if (consumer_port == port) throw std::runtime_error("consumer_port must differ from port");
+    if (max_consumers < 1 || max_consumers > 10000) {
+        throw std::runtime_error("max_consumers must be between 1 and 10000");
+    }
+    if (vehicle_offline_seconds < 1 || vehicle_offline_seconds > 86400) {
+        throw std::runtime_error("vehicle_offline_seconds must be between 1 and 86400");
     }
 }

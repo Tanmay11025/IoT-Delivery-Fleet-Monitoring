@@ -10,6 +10,15 @@ import time
 from pathlib import Path
 
 
+def telemetry_payload(stage, request_id):
+    """A valid TelemetryEvent whose vehicle_id makes each record unique."""
+    return json.dumps({
+        "vehicle_id": f"stage-{stage}-van-{request_id}",
+        "lat": 51.5074, "lng": -0.1278, "speed": 32.5,
+        "status": "moving", "timestamp": 1726310400,
+    }, separators=(",", ":"))
+
+
 def main():
     count = int(os.environ["CONCURRENCY"])
     stage = os.environ["STAGE"]
@@ -52,7 +61,7 @@ def main():
         if request_id == 0:
             request = b"GET /test/hold HTTP/1.1\r\nHost: gateway\r\n\r\n"
         else:
-            payload = f"stage-{stage}-record-{request_id}"
+            payload = telemetry_payload(stage, request_id)
             request = (f"POST /publish HTTP/1.1\r\nHost: gateway\r\n"
                        f"Content-Length: {len(payload)}\r\nConnection: close\r\n\r\n"
                        f"{payload}").encode("ascii")
@@ -107,7 +116,7 @@ def main():
                             latest_publish_completion = max(latest_publish_completion,
                                                             latency)
                     if code == 201:
-                        acknowledged.append(f"stage-{stage}-record-{request_id}")
+                        acknowledged.append(telemetry_payload(stage, request_id))
                     if request_id == 0 and (code != 200 or b"held" not in response):
                         read_failures += 1
                 except (ValueError, IndexError):
