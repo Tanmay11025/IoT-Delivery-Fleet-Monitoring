@@ -26,6 +26,7 @@ SERVER_CPUS="${SERVER_CPUS:-0-7}"
 CLIENT_CPUS="${CLIENT_CPUS:-8-15}"
 WRK_THREADS="${WRK_THREADS:-4}"
 PORT="${PORT:-18181}"
+SEGMENT_SIZE="${SEGMENT_SIZE:-268435456}"
 RESULTS="$ROOT/tests/benchmarks/results"
 mkdir -p "$RESULTS"
 CSV="$RESULTS/bench-$(date +%Y%m%d-%H%M%S).csv"
@@ -57,7 +58,7 @@ start_gateway() {
   taskset -c "$SERVER_CPUS" "$BINARY" --port "$PORT" --consumer-port 0 \
     --epoll-workers "$EPOLL_WORKERS" --pool-threads "$1" --queue-capacity 4096 \
     --backlog 4096 --rate-limit-capacity 1000000000 --rate-limit-refill-rate 1000000000 \
-    --storage-directory "$STORAGE" --storage-segment-size 268435456 \
+    --storage-directory "$STORAGE" --storage-segment-size "$SEGMENT_SIZE" \
     --dashboard-directory "$ROOT/dashboard" >/dev/null 2>&1 &
   GATEWAY_PID=$!
   for _ in $(seq 100); do
