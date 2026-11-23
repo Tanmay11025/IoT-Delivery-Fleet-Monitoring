@@ -4,6 +4,12 @@ project(message_gateway LANGUAGES CXX)
 
 find_package(Threads REQUIRED)
 
+# Without a build type CMake passes no optimisation flags at all, so default
+# to Release. Use -DCMAKE_BUILD_TYPE=Debug (or the CI sanitizer job) to debug.
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+	set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -212,3 +218,12 @@ add_case_tests(frame_codec_tests
 	frame_codec_splits_several_frames_from_one_read
 	frame_codec_rejects_invalid_frames
 )
+
+# Not a test: prints cache-vs-log read timings for docs/performance_results.md.
+add_executable(cache_vs_disk_bench
+	tests/benchmarks/cache_vs_disk_bench.cpp
+	src/storage/mmap_log.cpp
+)
+target_include_directories(cache_vs_disk_bench PRIVATE src)
+target_compile_options(cache_vs_disk_bench PRIVATE -Wall -Wextra -Wpedantic)
+target_link_libraries(cache_vs_disk_bench PRIVATE Threads::Threads)
