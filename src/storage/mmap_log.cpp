@@ -49,14 +49,31 @@ std::uint64_t get_u64(const unsigned char* source) {
     return value;
 }
 
+// CRC-32 (IEEE 802.3, reflected polynomial 0xedb88320), table-driven.
+//
+// The first version processed one bit per loop iteration. Profiling an 8 KiB
+// publish benchmark with callgrind showed that loop as ~60% of all
+// instructions, and it runs while append() holds the log mutex. A 256-entry
+// table built at compile time processes a byte per step and produces the
+// exact same checksums, so existing segment files remain valid.
+constexpr std::array<std::uint32_t, 256> make_crc32_table() {
+    std::array<std::uint32_t, 256> table{};
+    for (std::uint32_t index = 0; index < 256; ++index) {
+        std::uint32_t crc = index;
+        for (int bit = 0; bit < 8; ++bit) {
+            crc = (crc & 1U) ? (crc >> 1) ^ 0xedb88320U : crc >> 1;
+        }
+        table[index] = crc;
+    }
+    return table;
+}
+
+constexpr std::array<std::uint32_t, 256> crc32_table = make_crc32_table();
+
 std::uint32_t crc32_update(std::uint32_t crc, const unsigned char* bytes,
                            std::size_t length) {
     for (std::size_t index = 0; index < length; ++index) {
-        crc ^= bytes[index];
-        for (int bit = 0; bit < 8; ++bit) {
-            const std::uint32_t mask = 0U - (crc & 1U);
-            crc = (crc >> 1) ^ (0xedb88320U & mask);
-        }
+        crc = crc32_table[(crc ^ bytes[index]) & 0xffU] ^ (crc >> 8);
     }
     return crc;
 }
