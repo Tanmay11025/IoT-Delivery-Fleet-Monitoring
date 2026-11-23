@@ -35,11 +35,18 @@ The project has been built in layers:
   limiting, and graceful task draining.
 8. Versioned segmented mmap storage, restart recovery, and a recovered recent
   message cache.
+9. Telemetry validation on `POST /publish` and an in-memory fleet view
+  (`GET /vehicles`) with offline detection.
+10. A live fleet dashboard served by the gateway itself.
+11. A binary consumer protocol with replay from any offset, live tailing,
+  acknowledgements and per-consumer backpressure, plus a Python SDK.
+12. Chaos tests (`kill -9`, SIGTERM under load), a sustained-throughput
+  benchmark, and CI.
 
-The networking, HTTP transport, and persistent-log layers are implemented. A
-minimal `POST /publish` route appends non-empty request bodies as opaque records
-and returns their storage offset. Telemetry JSON validation and downstream
-delivery are not implemented yet.
+Every layer described in the project plan is now implemented. `POST /publish`
+validates each TelemetryEvent, appends it to the log, and updates the fleet
+view. Consumers stream records over their own protocol with at-least-once
+delivery. See [architecture.md](architecture.md) and [protocol.md](protocol.md).
 
 ### Technical view
 
@@ -51,9 +58,10 @@ header/body limits, and clear parse errors. It rejects unsupported
 
 ### In simple terms
 
-The roads, traffic lights, and mailroom are working. The mailroom can receive
-an HTTP package and check its size and format, but the part that understands
-whether a vehicle's location and status are valid is still being built.
+The roads, traffic lights, and mailroom are working. The mailroom now also
+reads each vehicle's report, refuses invalid ones, files the rest in order,
+keeps a board showing where every van is, and lets subscribers receive a copy
+of every report, starting from any point in the archive.
 
 ## 3. Protocol Architecture
 
@@ -63,13 +71,14 @@ The gateway has two distinct protocol roles:
   The intended application request is `POST /publish` with JSON in the body.
 - **The gateway** parses the HTTP message, validates its framing and limits,
   then routes a complete request to an application handler.
-- A minimal `POST /publish` handler stores non-empty opaque request bodies; it
-  does not validate telemetry JSON.
-- **Consumers**, planned for Week 9, will receive telemetry through a separate
-  binary TCP protocol. They will not use the producer-facing HTTP parser.
+- The `POST /publish` handler validates the TelemetryEvent JSON, appends it to
+  the log, and updates the fleet view.
+- **Consumers** receive telemetry through a separate binary TCP protocol on
+  `consumer_port`. They do not use the producer-facing HTTP parser.
+  See [protocol.md](protocol.md).
 
 HTTP was chosen and implemented for the producer side because it is a clear,
-readable, widely supported request format. The future binary TCP protocol is a
+readable, widely supported request format. The binary TCP protocol is a
 separate consumer-facing stream because consumers may need compact messages,
 lower overhead, and efficient continuous delivery.
 
@@ -77,14 +86,14 @@ lower overhead, and efficient continuous delivery.
 
 The protocol boundary is an ownership boundary. HTTP framing belongs to
 `HTTPParser`; HTTP formatting belongs to `HttpResponse`; application dispatch
-belongs to `Router`; future telemetry validation and persistence belong to an
-application layer; and the binary consumer stream will have its own protocol
-implementation.
+belongs to `Router`; telemetry validation belongs to `parse_telemetry`; and
+the binary consumer stream has its own `FrameDecoder` and pump on the same
+epoll workers.
 
 ### In simple terms
 
 Think of the gateway as a building with two entrances. Vehicles and SDKs use
-the normal front entrance, HTTP. Future consumers use a separate high-speed
+the normal front entrance, HTTP. Consumers use a separate high-speed
 entrance, binary TCP. Both use the same reliable building infrastructure, but
 they do not have to understand each other's entrance.
 
@@ -274,8 +283,10 @@ The executable currently registers:
   connection/request/completion counters and completion-queue depth/high-water,
   and log segment-file bytes.
 - `GET /recent` -> recent messages from the in-memory cache, serialized as JSON.
-- `POST /publish` -> appends a non-empty opaque request body and returns its
-  storage offset; it does not validate telemetry JSON.
+- `POST /publish` -> validates a TelemetryEvent, appends it, and returns
+  `{"offset":N}`; invalid bodies get `400 {"error":"..."}`.
+- `GET /vehicles` -> latest state per vehicle; `GET /consumers` -> consumer offsets.
+- `GET /` and `GET /dashboard/<file>` -> the dashboard (fixed whitelist).
 - `GET /test/hold` -> test-only delayed handler, registered only when
   `GATEWAY_TEST_MODE` is set.
 
@@ -397,7 +408,7 @@ The suite covers:
 - Slow-reader delivery of the 512 KiB `/large-response` body.
 - `/recent` cache response and count query validation.
 - `/metrics` Prometheus exposition, counter/histogram advancement, and required gauges.
-- `/publish` empty-body rejection and opaque-body persistence.
+- `/publish` empty-body rejection and persistence of a valid telemetry event.
 
 The command used was:
 
@@ -461,11 +472,10 @@ HTTP handling, graceful shutdown, and recovery at scale.
   `gateway_log_disk_bytes`.
 - Shared thread-pool queue high-water and per-epoll-worker request/completion
   queue metrics.
-- Opaque-body persistence through `POST /publish`.
+- Validated telemetry persistence through `POST /publish`.
 - Per-epoll-worker accepted/request/completion counters and completion-queue
   depth/high-water metrics, plus shared request-pool queue high-water.
-- Minimal opaque-body `POST /publish` persistence route; test-only shutdown hold
-  route is enabled only with `GATEWAY_TEST_MODE`.
+- A test-only shutdown hold route, enabled only with `GATEWAY_TEST_MODE`.
 - Staged HTTP concurrency, graceful shutdown, and restart-recovery tests through
   50,000 concurrent clients.
 - Current verification: 31/31 C++ tests and 13/13 HTTP integration tests pass;
@@ -474,23 +484,35 @@ HTTP handling, graceful shutdown, and recovery at scale.
 - C++ tests for configuration, pool behavior, rate limiting, storage recovery,
   rollover boundaries, oversized records, cache ordering, JSON escaping,
   metrics, and shutdown drain.
+- TelemetryEvent validation (`400` with a reason) and `FleetState` behind
+  `GET /vehicles`, rebuilt from the log on restart.
+- Binary consumer protocol (`SUBSCRIBE`, `FETCH_FROM`, `DATA`, `ACK`,
+  `ERROR`) with offset replay, live tailing, and 256 KiB per-consumer
+  backpressure, plus `GET /consumers` and consumer-lag metrics.
+- Python SDK (`python_sdk/`), a fleet simulator, a dispatch-monitor consumer,
+  and a single-vehicle replay tool (`examples/`).
+- Fleet Ops dashboard (`dashboard/`) served at `/`.
+- pytest integration and chaos suites, a `wrk` benchmark harness, and GitHub
+  Actions CI (Release, ASan/UBSan, Docker HTTP suite).
+- After the fleet work, the suite is 51 C++ CTest cases, 35 pytest cases and
+  the 13 Docker HTTP cases. See [performance_results.md](performance_results.md)
+  for throughput numbers.
 
 ### Planned next
 
-- Parse and validate telemetry JSON and field ranges.
-- Persist or forward validated telemetry through the new log API.
-- Implement the Week 9 binary consumer protocol.
-- Add authentication and broader spam/DDoS protection.
-- Add downstream backpressure and failure-recovery tests.
-- Repeat the staged load test on additional host hardware and with a sustained
-  workload profile.
+- Authentication/TLS for producers and consumers.
+- Bounded, expiring rate-limiter buckets.
+- Asynchronous sync of sealed segments, so rollover does not stall
+  appends (see performance_results.md).
+- Log retention and consumer groups.
+- HTTP keep-alive.
 
 ### Current limitations
 
-- Telemetry JSON is not yet validated by an application handler.
 - There is no authentication or authorization.
-- `POST /publish` stores opaque non-empty bodies but does not validate telemetry
-  JSON or deliver records downstream.
+- Durability covers a process crash, not power loss: records are not
+  `msync`'d individually.
+- Fleet state after a restart is rebuilt from the recent window only.
 - `gateway_log_disk_bytes` measures preallocated segment capacity, not only
   bytes containing valid records.
 - Keep-alive and pipelining are not implemented; connections close after one response.
@@ -503,16 +525,17 @@ HTTP handling, graceful shutdown, and recovery at scale.
 
 ### Interview summary
 
-**Technical answer:** The project establishes a thread-confined, event-driven
-TCP foundation and adds a bounded incremental HTTP transport layer. It has
-clear ownership boundaries between sockets, parsing, routing, and future
-telemetry processing. The durable log and recent cache are implemented; the
-main remaining work is connecting validated producer telemetry to that storage,
-consumer streaming, and production controls.
+**Technical answer:** A thread-confined epoll front end (one reuse-port loop
+per core) feeds a bounded worker pool that validates telemetry and appends
+it to a segmented, CRC-checked mmap log. Consumers replay that log by byte
+offset over a binary protocol with at-least-once delivery, and a derived
+in-memory fleet view powers the dashboard. Tests cover fragmentation, crash
+recovery, `kill -9` durability of acknowledged writes, and consumer resume.
 
-**Simple answer:** We first made sure the server can handle many connections
-reliably, understand HTTP safely, and retain records on disk. Next we need to
-validate incoming telemetry and connect it to storage and future consumers.
+**Simple answer:** Vans report their position over HTTP. The gateway checks
+each report, saves it safely, shows the fleet live on a map, and streams
+every report to other programs, which can pick up exactly where they left
+off after a crash.
 
 ## 15. Keeping This Document Updated
 

@@ -12,6 +12,16 @@ All test categories passed on this run. Detailed environment, metric definitions
 | Graceful shutdown under load | **9/9 clean exits** |
 | Persistence recovery across restart | **9/9 exact acknowledged-record sets recovered** |
 
+> **Update, 2026-11-24.** These runs used the Docker image built with a plain
+> `cmake -S . -B build`. CMake adds no optimisation flags when no build type
+> is set, so this binary was unoptimised and its latencies are pessimistic.
+> The correctness, capacity and recovery conclusions are unaffected. CMake
+> now defaults to Release (see [journal.md](journal.md)). Sustained
+> throughput, which these burst runs do not measure (§6.2), is reported in
+> [performance_results.md](performance_results.md). Telemetry validation and
+> consumer delivery, listed as missing in §6.2, are now implemented and
+> tested; see [architecture.md](architecture.md).
+
 ---
 
 ## 2. Build and Unit-Test Results

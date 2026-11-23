@@ -125,9 +125,9 @@ without scanning disk per request. It accepts an optional `count` query
 parameter, defaults to 100, permits values from 0 through 1000, and returns
 `400 Bad Request` for malformed, repeated, unknown, or over-limit query values.
 The returned set is chronological, oldest-to-newest. The executable's minimal
-`POST /publish` route rejects an empty body with `400`, appends a non-empty body
-as an opaque record, and returns `201 Created` with the record offset. It does
-not validate telemetry JSON. The `gateway_log_disk_bytes` metric sums segment
+`POST /publish` route (since the fleet work) validates the body as a
+TelemetryEvent, returning `400` with a reason when invalid, and otherwise
+appends it and returns `201 Created` with `{"offset":N}`. The `gateway_log_disk_bytes` metric sums segment
 file lengths and represents provisioned segment capacity, not only valid
 record bytes.
 
@@ -282,8 +282,10 @@ The executable currently registers these endpoints:
   in-memory circular cache as JSON.
 - `GET /large-response` returns a deterministic 512 KiB body for transport
   tests of slow readers and partial writes.
-- `POST /publish` appends a non-empty body as an opaque record and returns its
-  offset; it does not validate telemetry JSON.
+- `POST /publish` validates a TelemetryEvent, appends it, updates
+  `FleetState`, and returns `{"offset":N}`.
+- `GET /vehicles`, `GET /consumers`, and the dashboard routes are described
+  in [protocol.md](protocol.md).
 - `GET /test/hold` sleeps for 15 seconds and is registered only when
   `GATEWAY_TEST_MODE` is set for shutdown testing.
 
@@ -301,9 +303,8 @@ incremented after a client is accepted and decremented when that client is
 removed. This provides one safe aggregate value without reading another
 worker's map or adding locks to the normal connection path.
 
-The telemetry contract reserves `POST /publish` for telemetry JSON, but the
-current handler stores a non-empty body as an opaque record without JSON
-validation or downstream delivery.
+`POST /publish` accepts only valid TelemetryEvent JSON; consumers receive the
+stored records over the binary protocol (see [architecture.md](architecture.md)).
 
 The large-response endpoint is intentionally simple and deterministic. It is a
 transport test surface, not a telemetry feature: the body consists of repeated
@@ -357,7 +358,7 @@ The suite covers:
 - 100 concurrent raw-socket HTTP clients.
 - A slow reader consuming a 512 KiB response in small chunks.
 - `/recent` empty-cache JSON and query validation, plus `/metrics` exposition.
-- `/publish` empty-body rejection and opaque-body persistence visibility.
+- `/publish` empty-body rejection and visibility of a stored telemetry event.
 
 The last case uses `GET /large-response`, a deterministic transport-test
 endpoint that returns 512 KiB of `x` bytes. The client limits its receive
@@ -409,8 +410,9 @@ invalid and over-limit counts, JSON escaping, response content type, configured
 segment-size metrics, and graceful response draining. `metrics_tests` checks
 that the disk gauge's help text describes provisioned bytes.
 
-The integration suite verifies that `/publish` rejects an empty body and stores
-a non-empty opaque body. It does not validate telemetry JSON or field ranges.
+The Docker integration suite verifies that `/publish` rejects an empty body and
+stores a valid telemetry event. Field-level validation is covered by
+`telemetry_event_tests` and `tests/integration/test_telemetry_publish.py`.
 
 Run the staged backend test with:
 
@@ -449,17 +451,19 @@ TelemetryEvent {
 }
 ```
 
-The current `POST /publish` implementation treats the body as an opaque string
-and appends it to persistent storage. JSON parsing, field validation, and
-downstream delivery remain future application work. This keeps HTTP framing
-separate from the meaning and policy of telemetry records.
+`POST /publish` parses the body with `parse_telemetry`
+(`src/telemetry/telemetry_event.cpp`): a flat JSON object, all six fields
+required with the types and ranges in [protocol.md](protocol.md), unknown
+scalar fields ignored. Valid bodies are appended byte-for-byte; invalid ones
+get `400 {"error":"<reason>"}` and never reach the log. HTTP framing stays in
+`HTTPParser`; the meaning of a record stays in the telemetry layer.
 
 No additional telemetry endpoint is needed. `POST /publish` is the intended
 application contract.
 
 The protocol boundary is intentional: producers speak HTTP to this parser,
-while Week 9 consumers will use a separate binary TCP protocol. Consumers will
-not speak HTTP. Keeping those protocols separate allows the producer-facing API
+while consumers use a separate binary TCP protocol (`src/protocol/`). Consumers
+do not speak HTTP. Keeping those protocols separate allows the producer-facing API
 and consumer-facing stream format to evolve independently.
 
 ## 6. Why This Overall Approach Was Chosen
@@ -472,8 +476,10 @@ The implementation favors a small number of clear ownership boundaries:
 - HTTP framing belongs to `HTTPParser`.
 - HTTP formatting belongs to `HttpResponse`.
 - Application dispatch belongs to `Router` and route handlers.
-- Telemetry validation and publish-route integration belong to the future
-  application layer; the durable log API is now implemented.
+- Telemetry validation belongs to `parse_telemetry`; the derived fleet view
+  belongs to `FleetState`.
+- Consumer framing belongs to `FrameDecoder`; replay reads belong to
+  `MemoryMappedLog::read_from`.
 
 This structure was chosen for four reasons:
 
@@ -525,7 +531,7 @@ Implemented today:
 - Recent-message cache and `GET /recent`; log capacity gauge in `/metrics`.
 - Storage recovery, rollover, circular-cache, and recent-route test coverage.
 - A deterministic large-response endpoint for testing partial response writes.
-- Opaque-body `POST /publish` persistence route and opt-in shutdown hold route.
+- `POST /publish` persistence route (validated telemetry since the fleet work) and opt-in shutdown hold route.
 - Staged HTTP concurrency, graceful-shutdown, and persistence-recovery tests
   (100 through 50,000 concurrent clients; 9 stages, all passed).
 - Final Testing Plan with pre-run pass criteria, environment documentation,
@@ -533,14 +539,20 @@ Implemented today:
 - Telemetry event documentation.
 - Comprehensive test report in `docs/tests.md` and results summary in `docs/results.md`.
 
+Added by the fleet work (see [architecture.md](architecture.md)):
+
+- TelemetryEvent validation on `POST /publish`, `FleetState` and `GET /vehicles`.
+- Binary consumer protocol with replay (`read_from`), live tailing, ACKs,
+  backpressure, `GET /consumers`, and consumer metrics.
+- Dashboard served by the gateway; Python SDK; simulator, consumer and replay
+  examples.
+- pytest integration and chaos suites, `wrk` benchmark harness, CI.
+- Table-driven CRC32 and a Release default build (see [journal.md](journal.md)).
+
 Still to implement:
 
-- Validate telemetry JSON and its field ranges.
-- Connect validated `POST /publish` messages to persistent append and downstream delivery.
-- Add authentication, rate limiting, and spam/DDoS protection.
-- Add keep-alive or pipelining if required.
-- Add chunked transfer encoding if required.
-- Add application-level telemetry and failure tests.
-- Add inactive-IP bucket expiration and a bounded limiter map.
-- Add application-level telemetry tests after JSON validation and delivery are
-  implemented.
+- Authentication and TLS; broader spam/DDoS protection.
+- Inactive-IP bucket expiration and a bounded limiter map.
+- Asynchronous sync of sealed segments so rollover does not stall appends.
+- Log retention and consumer groups.
+- Keep-alive or pipelining, and chunked transfer encoding, if required.
