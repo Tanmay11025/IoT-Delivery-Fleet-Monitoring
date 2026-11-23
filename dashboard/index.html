@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Fleet Ops Dashboard</title>
+  <link rel="stylesheet" href="/dashboard/style.css">
+  <!-- Chart.js is the only third-party code; the page still works without it. -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js" defer></script>
+  <script src="/dashboard/fleet_map.js" defer></script>
+  <script src="/dashboard/charts.js" defer></script>
+  <script src="/dashboard/app.js" defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo" aria-hidden="true">◆</span>
+      <h1>Fleet Ops</h1>
+      <span class="subtitle">IoT delivery fleet monitoring</span>
+    </div>
+    <div class="status">
+      <span id="connection-pill" class="pill pill-wait">Connecting…</span>
+      <span class="meta">Uptime <strong id="uptime">–</strong></span>
+      <span class="meta">Updated <strong id="last-update">–</strong></span>
+    </div>
+  </header>
+
+  <div id="banner" class="banner" hidden>
+    Gateway unreachable — retrying every second. Showing the last data received.
+  </div>
+
+  <main>
+    <section class="kpis" aria-label="Key metrics">
+      <div class="kpi">
+        <span class="kpi-label">Active vehicles</span>
+        <span class="kpi-value" id="kpi-active">–</span>
+        <span class="kpi-sub" id="kpi-breakdown">moving · idle · offline</span>
+      </div>
+      <div class="kpi">
+        <span class="kpi-label">Telemetry events/sec</span>
+        <span class="kpi-value" id="kpi-eps">–</span>
+        <span class="kpi-sub" id="kpi-events-total">– total</span>
+      </div>
+      <div class="kpi">
+        <span class="kpi-label">Rejected</span>
+        <span class="kpi-value" id="kpi-rejected">–</span>
+        <span class="kpi-sub" id="kpi-rejected-sub">– rate-limited · – invalid</span>
+      </div>
+      <div class="kpi">
+        <span class="kpi-label">Request pool</span>
+        <span class="kpi-value" id="kpi-pool">–</span>
+        <span class="kpi-sub" id="kpi-pool-sub">busy / workers · queue –</span>
+      </div>
+      <div class="kpi">
+        <span class="kpi-label">Log</span>
+        <span class="kpi-value" id="kpi-log">–</span>
+        <span class="kpi-sub" id="kpi-log-sub">– on disk</span>
+      </div>
+      <div class="kpi">
+        <span class="kpi-label">Consumers</span>
+        <span class="kpi-value" id="kpi-consumers">–</span>
+        <span class="kpi-sub" id="kpi-lag">lag –</span>
+      </div>
+    </section>
+
+    <section class="grid">
+      <div class="card map-card">
+        <div class="card-head">
+          <h2>Fleet map</h2>
+          <div class="legend">
+            <span><i class="dot moving"></i>moving</span>
+            <span><i class="dot idle"></i>idle</span>
+            <span><i class="dot offline"></i>offline</span>
+          </div>
+        </div>
+        <div class="map-wrap">
+          <canvas id="fleet-map" aria-label="Vehicle positions"></canvas>
+          <div id="map-tooltip" class="tooltip" hidden></div>
+          <div id="map-empty" class="empty">No vehicles yet — start <code>examples/fleet_simulator.py</code>.</div>
+        </div>
+      </div>
+
+      <div class="card chart-card">
+        <div class="card-head"><h2>Telemetry events/sec</h2></div>
+        <div class="chart-wrap"><canvas id="chart-eps"></canvas></div>
+      </div>
+      <div class="card chart-card">
+        <div class="card-head"><h2>Active vehicles</h2></div>
+        <div class="chart-wrap"><canvas id="chart-vehicles"></canvas></div>
+      </div>
+    </section>
+
+    <section class="grid tables">
+      <div class="card">
+        <div class="card-head"><h2>Vehicles</h2><span class="hint" id="vehicle-count"></span></div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Vehicle</th><th>Status</th><th class="num">Speed</th><th class="num">Lat</th><th class="num">Lng</th><th class="num">Last seen</th></tr></thead>
+            <tbody id="vehicle-rows"></tbody>
+          </table>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-head"><h2>Recent telemetry</h2><span class="hint">from the in-memory cache</span></div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th class="num">Offset</th><th>Vehicle</th><th>Status</th><th class="num">Speed</th><th class="num">Received</th></tr></thead>
+            <tbody id="recent-rows"></tbody>
+          </table>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-head"><h2>Consumers</h2><span class="hint">binary protocol</span></div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>ID</th><th>Client</th><th class="num">Sent to</th><th class="num">Acked</th><th class="num">Lag</th></tr></thead>
+            <tbody id="consumer-rows"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    Data from <code>/metrics</code>, <code>/vehicles</code>, <code>/recent</code> and
+    <code>/consumers</code>, polled every second.
+  </footer>
+</body>
+</html>
