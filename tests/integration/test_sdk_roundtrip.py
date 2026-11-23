@@ -35,6 +35,28 @@ def test_replay_can_start_in_the_middle(gateway):
     assert [message.offset for message in replayed] == offsets[12:]
 
 
+def test_replay_larger_than_the_send_queue_completes(gateway):
+    """Regression: a replay several times the 256 KiB per-consumer queue must
+    finish without any new publish arriving to wake the consumer again."""
+    client = gateway.client()
+    note = "x" * 900  # ~1 KiB per record, ~2 MB of history in total.
+    offsets = [client.send_telemetry(telemetry(f"van-{index % 9}", note=note))
+               for index in range(2000)]
+    assert gateway.metric("gateway_log_end_offset") > 4 * 256 * 1024  # Many queue-fulls.
+
+    reader = gateway.client()
+    replayed = []
+    thread = threading.Thread(
+        target=lambda: replayed.extend(m.offset for m in reader.replay(from_offset=0)),
+        daemon=True)
+    thread.start()
+    thread.join(timeout=20)
+    if thread.is_alive():
+        reader.disconnect()
+        pytest.fail(f"replay stalled after {len(replayed)} of {len(offsets)} records")
+    assert replayed == offsets
+
+
 def test_live_subscriber_receives_new_records(gateway):
     publish_many(gateway, 5)  # History before subscribing is not delivered.
     consumer = gateway.client()
