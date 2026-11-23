@@ -5,20 +5,34 @@
 #include <cstdlib>
 #include <thread>
 
+namespace {
+void print_usage(ostream& output, const char* program) {
+    output << "Usage: " << program
+           << " [--config path] [--port n] [--backlog n] [--epoll-workers n]"
+              " [--pool-threads n] [--queue-capacity n] [--log-path path]"
+              " [--rate-limit-capacity n] [--rate-limit-refill-rate n]"
+              " [--storage-directory path] [--storage-segment-size bytes]"
+              " [--recent-capacity n] [--consumer-port n] [--max-consumers n]"
+              " [--dashboard-directory path] [--vehicle-offline-seconds n]\n";
+}
+}
+
 int main(int argc, char* argv[]) {
+    for (int index = 1; index < argc; ++index) {
+        const string argument(argv[index]);
+        if (argument == "--help" || argument == "-h") {
+            print_usage(cout, argv[0]);
+            return EXIT_SUCCESS;
+        }
+    }
+
     Config config;
     try {
         config = Config::from_args(argc, argv);
         Logger::set_file(config.log_path);
     } catch (const exception& error) {
-        cerr << error.what() << '\n'
-             << "Usage: " << argv[0]
-             << " [--config path] [--port n] [--backlog n] [--epoll-workers n]"
-                " [--pool-threads n] [--queue-capacity n] [--log-path path]"
-                     " [--rate-limit-capacity n] [--rate-limit-refill-rate n]"
-                     " [--storage-directory path] [--storage-segment-size bytes]"
-                     " [--recent-capacity n] [--consumer-port n] [--max-consumers n]"
-                     " [--dashboard-directory path] [--vehicle-offline-seconds n]\n";
+        cerr << error.what() << '\n';
+        print_usage(cerr, argv[0]);
         return EXIT_FAILURE;
     }
 
