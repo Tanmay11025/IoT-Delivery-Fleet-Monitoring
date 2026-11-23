@@ -220,7 +220,7 @@ add_case_tests(frame_codec_tests
 	frame_codec_rejects_invalid_frames
 )
 
-# Not a test: prints cache-vs-log read timings for docs/performance_results.md.
+# Not a test: prints cache-vs-log read timings for docs/results.md §6.5.
 add_executable(cache_vs_disk_bench
 	tests/benchmarks/cache_vs_disk_bench.cpp
 	src/storage/mmap_log.cpp

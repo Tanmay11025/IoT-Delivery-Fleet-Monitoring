@@ -121,7 +121,7 @@ results.md) used an unoptimised binary. Those results are still valid as
 correctness and capacity evidence, but their latencies are pessimistic.
 
 **Fix.** CMake now defaults to `Release` when no build type is given. The
-benchmarks in performance_results.md were all built in Release. CI's
+benchmarks in results.md §6 were all built in Release. CI's
 sanitizer job sets `Debug` explicitly.
 
 ---
@@ -146,4 +146,4 @@ rollover, and its size scales with how much there is to sync.
 **Status.** Documented, not fixed. The fix is to move `msync`/`fsync`/`munmap`
 of the sealed segment to a background thread, so appends to the new segment
 never wait. It needs care so that recovery still sees a fully synced segment
-before it is treated as sealed. Details: performance_results.md §3.
+before it is treated as sealed. Details: results.md §6.3.

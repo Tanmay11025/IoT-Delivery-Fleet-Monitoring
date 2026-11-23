@@ -495,7 +495,7 @@ HTTP handling, graceful shutdown, and recovery at scale.
 - pytest integration and chaos suites, a `wrk` benchmark harness, and GitHub
   Actions CI (Release, ASan/UBSan, Docker HTTP suite).
 - After the fleet work, the suite is 51 C++ CTest cases, 35 pytest cases and
-  the 13 Docker HTTP cases. See [performance_results.md](performance_results.md)
+  the 13 Docker HTTP cases. See [results.md §6](results.md#6-sustained-throughput-benchmark)
   for throughput numbers.
 
 ### Planned next
@@ -503,7 +503,7 @@ HTTP handling, graceful shutdown, and recovery at scale.
 - Authentication/TLS for producers and consumers.
 - Bounded, expiring rate-limiter buckets.
 - Asynchronous sync of sealed segments, so rollover does not stall
-  appends (see performance_results.md).
+  appends (see results.md §6.3).
 - Log retention and consumer groups.
 - HTTP keep-alive.
 

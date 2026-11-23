@@ -23,7 +23,7 @@ append-only log with replay and at-least-once consumers) and **Prometheus**
 
 - **~77,000 validated telemetry events/s** at 1.03 ms P99
   (120-byte events, 100 connections, 4 pool threads, one laptop) ·
-  [benchmark report](docs/performance_results.md)
+  [benchmark report](docs/results.md#6-sustained-throughput-benchmark)
 - **50,000 concurrent clients** in the staged burst test, with every
   acknowledged write recovered after restart · [results](docs/results.md)
 - **Acknowledged writes survive `kill -9`** mid-stream, verified by a chaos
@@ -166,7 +166,7 @@ docs/          architecture, protocol, performance results, journal, test report
   the consumer's offset commit and side effects to be atomic.
 - **Rollover stall:** a full segment is `msync`'d while appends wait, which
   shows up as P99 spikes with large bodies. The fix is to sync sealed
-  segments in the background ([performance results](docs/performance_results.md)).
+  segments in the background ([results §6.3](docs/results.md#63-interpretation)).
 - **HTTP:** one request per connection (no keep-alive); chunked encoding is
   rejected.
 - **Fleet features:** geofencing rules, route history queries by time (replay
@@ -176,8 +176,8 @@ docs/          architecture, protocol, performance results, journal, test report
 
 [architecture.md](docs/architecture.md) ·
 [protocol.md](docs/protocol.md) ·
-[performance_results.md](docs/performance_results.md) ·
 [journal.md](docs/journal.md) ·
-[results.md](docs/results.md) / [tests.md](docs/tests.md) (staged load tests) ·
+[results.md](docs/results.md) (test results, load tests and benchmarks) ·
+[tests.md](docs/tests.md) (staged load-test details) ·
 [implementation.md](docs/implementation.md) ·
 [project overview.md](docs/project%20overview.md)

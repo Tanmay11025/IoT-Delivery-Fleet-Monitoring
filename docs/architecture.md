@@ -2,7 +2,7 @@
 
 This document explains how the gateway is put together and why. Wire formats
 are in [protocol.md](protocol.md); measured behaviour is in
-[performance_results.md](performance_results.md) and [results.md](results.md).
+[results.md](results.md) (burst tests in §4, sustained benchmark in §6).
 
 ## 1. System overview
 
