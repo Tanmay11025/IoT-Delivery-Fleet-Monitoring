@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gateway-client"
+version = "1.0.0"
+description = "Python client for the IoT Delivery Fleet Monitoring gateway"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = []  # Standard library only.
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: POSIX :: Linux",
+]
+
+[tool.setuptools]
+packages = ["gateway_client"]
