@@ -138,6 +138,7 @@ add_case_tests(mmap_log_tests
 	mmap_log_truncates_payload_left_before_record_header
 	mmap_log_truncates_a_record_with_a_partial_payload
 	mmap_log_fails_on_corruption_in_a_sealed_segment
+	mmap_log_reads_from_an_offset_across_segments
 )
 
 add_executable(storage_recovery_verify
