@@ -30,6 +30,8 @@
 #include "../monitoring/metrics.h"
 #include "thread_pool.h"
 #include "../storage/mmap_log.h"
+#include "../telemetry/fleet_state.h"
+#include <unordered_map>
 
 using namespace std;
 
@@ -71,18 +73,20 @@ public:
         return metrics.active_connections();
     }
 
-    string metrics_text() const {
-        const auto stats = thread_pool ? thread_pool->stats() : ThreadPool::Stats{0, 0, 0, 0};
-        return metrics.prometheus_text(stats.worker_count, stats.busy_threads,
-                                       stats.queue_length, storage_log.disk_usage_bytes(),
-                                       stats.queue_high_water);
-    }
+    string metrics_text() const;
 
     std::string recent_messages_json(std::size_t count = 100) const;
     HttpResponse recent_messages_response(const HttpRequest& request) const;
-    std::uint64_t append_message(const std::string& payload) {
-        return storage_log.append(payload);
-    }
+
+    // Append an opaque record and wake any streaming consumers.
+    std::uint64_t append_message(const std::string& payload);
+
+    // POST /publish: validate a TelemetryEvent, append it, update fleet state.
+    HttpResponse publish_telemetry(const HttpRequest& request);
+
+    // GET /vehicles and GET /consumers bodies.
+    std::string vehicles_json() const { return fleet_state.to_json(); }
+    std::string consumers_json() const;
 
     void add_route(string method, string path, Router::Handler handler) {
         router.add_route(std::move(method), std::move(path), std::move(handler));
@@ -99,12 +103,28 @@ private:
 
     struct LoopState {
         int completion_fd = -1;
+        int consumer_listener_fd = -1;
         mutex completion_mutex;
         queue<Completion> completions;
         atomic<size_t> outstanding_tasks{0};
+        // Set by publishers (pool threads) when new records exist, so the
+        // worker pushes them to its consumers on the next wake-up.
+        atomic<bool> data_available{false};
+        // Mirrors ConnectionManager::consumer_count() for publisher threads,
+        // which skip the eventfd write when a worker has no consumers.
+        atomic<size_t> consumer_count{0};
         std::uint64_t next_generation = 1;
         std::size_t worker_id = 0;
         bool draining = false;
+    };
+
+    // What /consumers and the lag metric report about one consumer.
+    struct ConsumerInfo {
+        std::string client_ip;
+        bool streaming = false;
+        std::uint64_t cursor = 0;
+        std::uint64_t acked = 0;
+        chrono::steady_clock::time_point connected_at;
     };
 
     // Run one complete listener, epoll loop, and connection manager.
@@ -133,8 +153,25 @@ private:
     // Remove a client from epoll and release its socket.
     void close_client(EpollLoop& loop, ConnectionManager& connections, int client_fd);
 
+    // Binary consumer protocol (runs on the epoll worker, not the pool).
+    void accept_consumers(EpollLoop& loop, ConnectionManager& connections, LoopState& state);
+    void handle_consumer_event(EpollLoop& loop, ConnectionManager& connections,
+                               LoopState& state, int fd, unsigned int events);
+    void handle_consumer_frame(EpollLoop& loop, ConnectionManager& connections,
+                               int fd, const Frame& frame);
+    void pump_consumer(EpollLoop& loop, ConnectionManager& connections,
+                       const LoopState& state, int fd);
+    void fail_consumer(EpollLoop& loop, ConnectionManager& connections, int fd,
+                       const std::string& message);
+    void record_consumer(const Connection& connection);
+    void notify_consumers();
+    void rebuild_fleet_state();
+
     // A slow receiver may otherwise grow its queued echo data without bound.
     static constexpr size_t max_outbound_bytes = 1U << 20; // 1 MiB per client
+    // A consumer is only refilled from the log once its queue drops below this.
+    static constexpr size_t consumer_high_water_bytes = 256 * 1024;
+    static constexpr size_t consumer_read_batch_bytes = 64 * 1024;
 
     Config config;
     unsigned int epoll_worker_count;
@@ -143,5 +180,15 @@ private:
     vector<thread> workers;
     unique_ptr<ThreadPool> thread_pool;
     MemoryMappedLog storage_log;
+    FleetState fleet_state;
     Router router;
+
+    // Each worker registers its LoopState so publishers can wake it.
+    mutex loop_states_mutex;
+    vector<LoopState*> loop_states;
+
+    atomic<size_t> consumer_total{0};
+    atomic<std::uint64_t> next_consumer_id{1};
+    mutable mutex consumer_registry_mutex;
+    std::unordered_map<std::uint64_t, ConsumerInfo> consumer_registry;
 };

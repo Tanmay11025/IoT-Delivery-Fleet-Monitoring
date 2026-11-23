@@ -13,8 +13,8 @@ COPY . .
 RUN cmake -S . -B build \
     && cmake --build build
 
-# Document the TCP port used by the default server configuration.
-EXPOSE 8080
+# Document the HTTP and consumer-protocol ports used by the default configuration.
+EXPOSE 8080 9090
 
 # Start the compiled gateway when a container is launched.
 CMD ["./build/message_gateway"]

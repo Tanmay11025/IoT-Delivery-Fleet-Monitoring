@@ -272,6 +272,99 @@ void mmap_log_fails_on_corruption_in_a_sealed_segment() {
     std::filesystem::remove_all(directory);
 }
 
+// Reference bit-at-a-time CRC-32 (IEEE 802.3). The log's own implementation
+// may be optimised, but the bytes it writes must never change.
+std::uint32_t reference_crc32(const std::string& bytes) {
+    std::uint32_t crc = 0xffffffffU;
+    for (const unsigned char byte : bytes) {
+        crc ^= byte;
+        for (int bit = 0; bit < 8; ++bit) crc = (crc & 1U) ? (crc >> 1) ^ 0xedb88320U : crc >> 1;
+    }
+    return crc ^ 0xffffffffU;
+}
+
+void mmap_log_writes_standard_crc32_checksums() {
+    assert(reference_crc32("123456789") == 0xCBF43926U);  // The standard check value.
+    const auto directory = test_directory("crc");
+    const std::string payloads[] = {"", "x", std::string(5000, 'q'), "{\"vehicle_id\":\"van-1\"}"};
+    {
+        MemoryMappedLog log;
+        log.open(directory, 1 << 16, 8);
+        for (const auto& payload : payloads) log.append(payload);
+    }
+    std::FILE* file = std::fopen(segment_file(directory, 1).c_str(), "rb");
+    assert(file != nullptr);
+    long position = MemoryMappedLog::segment_header_size;
+    for (const auto& payload : payloads) {
+        std::string record(MemoryMappedLog::record_header_size + payload.size(), '\0');
+        assert(std::fseek(file, position, SEEK_SET) == 0);
+        assert(std::fread(record.data(), 1, record.size(), file) == record.size());
+        const auto* bytes = reinterpret_cast<const unsigned char*>(record.data());
+        std::uint32_t stored = 0;
+        for (int index = 0; index < 4; ++index) stored |= static_cast<std::uint32_t>(bytes[28 + index]) << (index * 8);
+        // The checksum covers the first 28 header bytes followed by the payload.
+        assert(stored == reference_crc32(record.substr(0, 28) + payload));
+        assert(record.substr(MemoryMappedLog::record_header_size) == payload);
+        position += static_cast<long>(record.size());
+    }
+    std::fclose(file);
+    std::filesystem::remove_all(directory);
+}
+
+void mmap_log_reads_from_an_offset_across_segments() {
+    const auto directory = test_directory("read-from");
+    std::vector<std::uint64_t> offsets;
+    {
+        MemoryMappedLog log;
+        // 200-byte segments hold four 40-byte records, so 10 records span 3 segments.
+        log.open(directory, 200, 4);
+        for (int index = 0; index < 10; ++index) {
+            offsets.push_back(log.append("record-" + std::to_string(index)));
+        }
+        assert(log.segments().size() == 3);
+
+        const LogReadResult all = log.read_from(0, 1 << 20);
+        assert(all.messages.size() == 10);
+        for (int index = 0; index < 10; ++index) {
+            assert(all.messages[index].offset == offsets[index]);
+            assert(all.messages[index].payload == "record-" + std::to_string(index));
+        }
+        assert(all.next_offset == log.next_offset());
+
+        // Start in the middle of the second segment.
+        const LogReadResult tail = log.read_from(offsets[5], 1 << 20);
+        assert(tail.messages.size() == 5);
+        assert(tail.messages.front().payload == "record-5");
+
+        // A small byte budget still returns at least one record and a resume point.
+        const LogReadResult first = log.read_from(0, 1);
+        assert(first.messages.size() == 1);
+        assert(first.next_offset == offsets[1]);
+        assert(log.read_from(first.next_offset, 1).messages.front().payload == "record-1");
+
+        // Reading at the end returns nothing; past the end or mid-record is an error.
+        const LogReadResult end = log.read_from(log.next_offset());
+        assert(end.messages.empty());
+        assert(end.next_offset == log.next_offset());
+        bool threw = false;
+        try { (void)log.read_from(log.next_offset() + 1); } catch (const std::out_of_range&) { threw = true; }
+        assert(threw);
+        threw = false;
+        try { (void)log.read_from(offsets[3] + 1); } catch (const std::invalid_argument&) { threw = true; }
+        assert(threw);
+    }
+    {
+        // The same reads work after a restart, from sealed segments on disk.
+        MemoryMappedLog log;
+        log.open(directory, 200, 4);
+        const LogReadResult replay = log.read_from(offsets[2], 1 << 20);
+        assert(replay.messages.size() == 8);
+        assert(replay.messages.front().payload == "record-2");
+        assert(replay.messages.back().payload == "record-9");
+    }
+    std::filesystem::remove_all(directory);
+}
+
 int main(int argc, char* argv[]) {
     TestRunner runner(argc, argv);
     runner.run("mmap_log_recovers_records_after_reopen", mmap_log_recovers_records_after_reopen);
@@ -287,6 +380,10 @@ int main(int argc, char* argv[]) {
                mmap_log_truncates_payload_left_before_record_header);
     runner.run("mmap_log_truncates_a_record_with_a_partial_payload",
                mmap_log_truncates_a_record_with_a_partial_payload);
+    runner.run("mmap_log_reads_from_an_offset_across_segments",
+               mmap_log_reads_from_an_offset_across_segments);
+    runner.run("mmap_log_writes_standard_crc32_checksums",
+               mmap_log_writes_standard_crc32_checksums);
     runner.run("mmap_log_fails_on_corruption_in_a_sealed_segment",
                mmap_log_fails_on_corruption_in_a_sealed_segment);
     return runner.finish();

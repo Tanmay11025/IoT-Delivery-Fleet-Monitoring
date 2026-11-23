@@ -2,3 +2,8 @@ build/
 data/log/
 build-*/
 docs/Project_Plan.md
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+*.offset

@@ -8,6 +8,17 @@
 #include <mutex>
 #include <string>
 
+// Values owned by other components, sampled at scrape time.
+struct FleetGauges {
+    std::size_t vehicles_total = 0;
+    std::size_t vehicles_active = 0;
+    std::size_t vehicles_moving = 0;
+    std::size_t vehicles_idle = 0;
+    std::size_t vehicles_offline = 0;
+    std::uint64_t log_end_offset = 0;
+    std::uint64_t consumer_lag_bytes = 0;
+};
+
 class Metrics {
 public:
     using Clock = std::chrono::steady_clock;
@@ -24,12 +35,23 @@ public:
     void completion_queue_size(std::size_t worker_id, std::size_t size);
     void parse_error();
 
+    // Telemetry accepted into the log / rejected by validation.
+    void telemetry_accepted();
+    void telemetry_rejected();
+
+    // Binary-protocol consumers (tracked separately from HTTP connections).
+    void consumer_connected();
+    void consumer_disconnected();
+    void consumer_records_sent(std::uint64_t count);
+    std::size_t consumers_connected() const;
+
     std::size_t active_connections() const;
     std::string prometheus_text(std::size_t pool_workers = 0,
                                 std::size_t busy_threads = 0,
                                 std::size_t queue_length = 0,
                                 std::uint64_t log_disk_bytes = 0,
-                                std::size_t queue_high_water = 0) const;
+                                std::size_t queue_high_water = 0,
+                                const FleetGauges& fleet = {}) const;
 
 private:
     static constexpr std::array<double, 11> duration_buckets{
@@ -42,6 +64,10 @@ private:
     std::atomic<std::uint64_t> requests{0};
     std::atomic<std::uint64_t> blocked_requests{0};
     std::atomic<std::uint64_t> parse_errors{0};
+    std::atomic<std::uint64_t> telemetry_events{0};
+    std::atomic<std::uint64_t> telemetry_rejections{0};
+    std::atomic<std::size_t> open_consumers{0};
+    std::atomic<std::uint64_t> consumer_records{0};
     std::array<std::atomic<std::uint64_t>, 5> response_status_classes{};
 
     struct EpollWorkerMetrics {

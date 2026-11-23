@@ -49,14 +49,31 @@ std::uint64_t get_u64(const unsigned char* source) {
     return value;
 }
 
+// CRC-32 (IEEE 802.3, reflected polynomial 0xedb88320), table-driven.
+//
+// The first version processed one bit per loop iteration. Profiling an 8 KiB
+// publish benchmark with callgrind showed that loop as ~60% of all
+// instructions, and it runs while append() holds the log mutex. A 256-entry
+// table built at compile time processes a byte per step and produces the
+// exact same checksums, so existing segment files remain valid.
+constexpr std::array<std::uint32_t, 256> make_crc32_table() {
+    std::array<std::uint32_t, 256> table{};
+    for (std::uint32_t index = 0; index < 256; ++index) {
+        std::uint32_t crc = index;
+        for (int bit = 0; bit < 8; ++bit) {
+            crc = (crc & 1U) ? (crc >> 1) ^ 0xedb88320U : crc >> 1;
+        }
+        table[index] = crc;
+    }
+    return table;
+}
+
+constexpr std::array<std::uint32_t, 256> crc32_table = make_crc32_table();
+
 std::uint32_t crc32_update(std::uint32_t crc, const unsigned char* bytes,
                            std::size_t length) {
     for (std::size_t index = 0; index < length; ++index) {
-        crc ^= bytes[index];
-        for (int bit = 0; bit < 8; ++bit) {
-            const std::uint32_t mask = 0U - (crc & 1U);
-            crc = (crc >> 1) ^ (0xedb88320U & mask);
-        }
+        crc = crc32_table[(crc ^ bytes[index]) & 0xffU] ^ (crc >> 8);
     }
     return crc;
 }
@@ -235,6 +252,97 @@ void MemoryMappedLog::close() {
 std::vector<Message> MemoryMappedLog::get_recent(std::size_t count) const {
     std::lock_guard<std::mutex> lock(mutex);
     return recent_cache.get_recent(count);
+}
+
+LogReadResult MemoryMappedLog::read_from(std::uint64_t offset, std::size_t max_bytes) const {
+    // Snapshot the index under the lock. Everything below `end_offset` is
+    // immutable once written (the log is append-only), so the actual reads can
+    // happen without holding the lock and without blocking appends.
+    std::vector<LogSegmentInfo> index;
+    std::uint64_t end = 0;
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (!opened) throw std::logic_error("memory-mapped log is not open");
+        index = segment_index;
+        end = next_message_offset;
+    }
+
+    LogReadResult result;
+    result.next_offset = offset;
+    if (offset > end) throw std::out_of_range("offset is beyond the end of the log");
+    if (offset == end) return result;
+
+    // Segments are created in offset order, so a binary search over their
+    // first offsets finds the segment that holds `offset`.
+    auto segment = std::upper_bound(index.begin(), index.end(), offset,
+                                    [](std::uint64_t value, const LogSegmentInfo& info) {
+                                        return value < info.first_offset;
+                                    });
+    if (segment == index.begin()) throw std::invalid_argument("offset precedes the log");
+    --segment;
+
+    std::size_t payload_bytes = 0;
+    std::uint64_t current = offset;
+    for (; segment != index.end() && current < end; ++segment) {
+        if (current >= segment->end_offset) continue;
+        const int fd = ::open(segment->path.c_str(), O_RDONLY | O_CLOEXEC);
+        if (fd == -1) throw_errno("open", segment->path);
+
+        while (current < segment->end_offset) {
+            // Offsets count record bytes only, so the file position is a
+            // constant shift from the segment's first offset.
+            const std::uint64_t position =
+                segment_header_size + (current - segment->first_offset);
+            if (segment->end_offset - current < record_header_size) {
+                ::close(fd);
+                throw std::invalid_argument("offset is not a record boundary");
+            }
+            std::array<unsigned char, record_header_size> header{};
+            std::size_t bytes_read = 0;
+            if (!pread_all(fd, header.data(), header.size(), static_cast<off_t>(position),
+                           bytes_read) || bytes_read != header.size()) {
+                ::close(fd);
+                throw std::runtime_error("unable to read record header: " +
+                                         segment->path.string());
+            }
+            if (get_u32(header.data()) != record_magic ||
+                get_u64(header.data() + 8) != current) {
+                ::close(fd);
+                throw std::invalid_argument("offset is not a record boundary");
+            }
+            const std::uint32_t length = get_u32(header.data() + 24);
+            if (segment->end_offset - current - record_header_size < length) {
+                ::close(fd);
+                throw std::invalid_argument("offset is not a record boundary");
+            }
+            std::string payload(length, '\0');
+            if (length != 0 &&
+                (!pread_all(fd, reinterpret_cast<unsigned char*>(payload.data()), length,
+                            static_cast<off_t>(position + record_header_size), bytes_read) ||
+                 bytes_read != length)) {
+                ::close(fd);
+                throw std::runtime_error("unable to read record payload: " +
+                                         segment->path.string());
+            }
+            if (get_u32(header.data() + 28) != record_crc(header.data(), payload)) {
+                ::close(fd);
+                throw std::runtime_error("record checksum mismatch: " + segment->path.string());
+            }
+
+            const std::uint64_t timestamp = get_u64(header.data() + 16);
+            result.messages.push_back(Message{current, timestamp, length, std::move(payload)});
+            current += record_header_size + length;
+            payload_bytes += length;
+            if (payload_bytes >= max_bytes) {
+                ::close(fd);
+                result.next_offset = current;
+                return result;
+            }
+        }
+        ::close(fd);
+    }
+    result.next_offset = current;
+    return result;
 }
 
 std::vector<LogSegmentInfo> MemoryMappedLog::segments() const {

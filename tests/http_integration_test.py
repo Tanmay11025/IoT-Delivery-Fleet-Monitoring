@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Raw-socket HTTP integration tests for the running gateway."""
 
+import json
 import os
 import socket
 import time
@@ -304,7 +305,8 @@ def test_publish_appends_and_recent_recovers_message():
         b"POST /publish HTTP/1.1\r\nHost: gateway\r\nContent-Length: 0\r\n\r\n"
     )
     assert status == "HTTP/1.1 400 Bad Request"
-    payload = b"integration-persistent-record"
+    payload = (b'{"vehicle_id":"integration-van","lat":51.5,"lng":-0.12,'
+               b'"speed":30,"status":"moving","timestamp":1726310400}')
     request = (
         b"POST /publish HTTP/1.1\r\nHost: gateway\r\nContent-Length: "
         + str(len(payload)).encode("ascii")
@@ -317,7 +319,8 @@ def test_publish_appends_and_recent_recovers_message():
         b"GET /recent?count=1 HTTP/1.1\r\nHost: gateway\r\n\r\n"
     )
     assert status == "HTTP/1.1 200 OK"
-    assert b'"payload":"integration-persistent-record"' in recent
+    [record] = json.loads(recent)
+    assert json.loads(record["payload"]) == json.loads(payload)
 
 
 def main():

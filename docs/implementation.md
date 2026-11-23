@@ -2,10 +2,12 @@
 
 ## 1. Project Purpose
 
-This project is building a Linux-based gateway for delivery-fleet telemetry.
-Vehicles and connected devices will send location, speed, status, and timing
-data to the gateway. The gateway is intended to accept many connections,
-process requests reliably, and later forward valid telemetry to other services.
+This project is a Linux-based gateway for delivery-fleet telemetry. Vehicles
+and connected devices send location, speed, status, and timing data over
+HTTP. The gateway accepts many connections, validates each report, stores it
+in a crash-safe append-only log, keeps a live view of every vehicle for the
+dashboard, and streams stored reports to downstream consumers over a binary
+protocol.
 
 The project was built in layers. We started with the smallest useful network
 program, proved that the operating-system primitives worked, and then added
@@ -18,9 +20,14 @@ to debug a reliable TCP foundation before adding parsing and application logic.
 ### 2.1 Build and runtime configuration
 
 The gateway is a CMake-based C++17 executable built with `-Wall`, `-Wextra`,
-and `-Wpedantic`. `Config` centralizes the listening port, backlog, epoll worker
-count, request-pool size and queue capacity, log path, and rate-limit policy.
-It also centralizes the log directory, segment size, and recent-cache capacity.
+and `-Wpedantic`. When no `CMAKE_BUILD_TYPE` is given, CMake now defaults to
+`Release`; before this change such builds (including the Docker image) had no
+optimisation flags at all. `Config` centralizes the listening port, backlog,
+epoll worker count, request-pool size and queue capacity, log path, and
+rate-limit policy. It also centralizes the log directory, segment size,
+recent-cache capacity, the consumer port (`consumer_port`, 0 disables it) and
+connection cap (`max_consumers`), the dashboard directory
+(`dashboard_directory`), and the offline window (`vehicle_offline_seconds`).
 Values load from a simple `key=value` file, and CLI options override file
 values. Configuration is validated before server startup; `config.example.ini`
 shows the supported settings.
@@ -41,9 +48,15 @@ periodic drain callback so shutdown progresses even without socket activity.
 
 ### 2.4 Connection ownership and buffering
 
-Each epoll worker owns one listener, event loop, and `ConnectionManager`.
-Connections contain their parser, inbound/outbound buffers, partial-write
-offset, peer-close state, in-flight flag, and generation token. A 1 MiB
+Each epoll worker owns one HTTP listener, one consumer listener (when
+`consumer_port` is non-zero), an event loop, and a `ConnectionManager`.
+Connections contain their kind (HTTP or consumer), HTTP parser,
+inbound/outbound buffers, partial-write offset, peer-close state, in-flight
+flag, and generation token. Consumer connections also hold a frame decoder,
+a cursor (next log offset to send), the offset the consumer has acknowledged,
+and a consumer ID. `ConnectionManager` keeps a separate set of consumer
+descriptors, so new records can be pushed without scanning every HTTP
+connection. A 1 MiB
 per-connection output limit bounds slow-reader memory use. The generation token
 prevents a late asynchronous response from being applied to a new connection
 that reused the same file descriptor.
@@ -64,7 +77,10 @@ checks the connection generation, appends output, and sends the response.
 `SIGINT` and `SIGTERM` set an atomic shutdown flag. Epoll workers stop
 accepting connections and new tasks, close idle or incomplete clients, and
 remain active to process completions. The pool rejects submissions after
-shutdown begins and drains all accepted tasks. Each epoll loop exits only when
+shutdown begins and drains all accepted tasks. Consumer connections are
+closed immediately when the drain starts: they have no in-flight work, and a
+consumer's position is its own saved offset, so it reconnects and resumes.
+Each epoll loop exits only when
 its outstanding tasks and connections are gone; the server then joins the
 epoll threads and pool workers. Hard listener errors trigger the same drain
 path, while client errors remove the descriptor and close the connection.
@@ -98,7 +114,12 @@ segment index entry records its ID, path, first/end message offsets, and valid
 physical byte boundary for later offset seeking. Payload bytes are copied
 before the record header. The segment-header CRC covers its first 32 bytes;
 the record CRC is CRC-32/IEEE over the first 28 record-header bytes followed by
-the payload. Both CRC values are stored little-endian.
+the payload. Both CRC values are stored little-endian. The CRC was first
+computed one bit at a time; profiling showed that loop as ~60% of CPU under
+8 KiB publishes (it runs inside the log mutex), so it now uses a 256-entry
+table built at compile time. The output is bit-identical, which
+`mmap_log_writes_standard_crc32_checksums` enforces against a reference
+implementation, so existing segment files remain valid.
 
 Startup scans segments in ID order, validates segment headers and each record's
 offset, bounds, and checksum, rebuilds the recent-message cache, and resumes at
@@ -124,12 +145,107 @@ append and cache reads with its mutex. `GET /recent` serializes that cache
 without scanning disk per request. It accepts an optional `count` query
 parameter, defaults to 100, permits values from 0 through 1000, and returns
 `400 Bad Request` for malformed, repeated, unknown, or over-limit query values.
-The returned set is chronological, oldest-to-newest. The executable's minimal
-`POST /publish` route rejects an empty body with `400`, appends a non-empty body
-as an opaque record, and returns `201 Created` with the record offset. It does
-not validate telemetry JSON. The `gateway_log_disk_bytes` metric sums segment
+The returned set is chronological, oldest-to-newest. The executable's
+`POST /publish` route (since the fleet work) validates the body as a
+TelemetryEvent, returning `400` with a reason when invalid, and otherwise
+appends it and returns `201 Created` with `{"offset":N}`. The `gateway_log_disk_bytes` metric sums segment
 file lengths and represents provisioned segment capacity, not only valid
 record bytes.
+
+### 2.8 Telemetry validation and fleet state
+
+`parse_telemetry` (`src/telemetry/telemetry_event.cpp`) is a small
+hand-written reader for exactly one flat JSON object. It supports strings
+(with escapes, including `\uXXXX` outside the surrogate range), numbers,
+`true`/`false`/`null`, and rejects nesting, duplicate keys, raw control
+characters, trailing data, and bodies over 16 KiB. It then checks the six
+required fields and their ranges (see [protocol.md](protocol.md)). Unknown
+scalar fields are ignored so devices can send extras. A hand-written parser
+was chosen over a JSON library because the format is fixed and flat, the
+project builds everything from scratch, and each error can name the exact
+field. Runs of plain characters are copied with one `append`; copying one
+character at a time had shown up as ~30% of CPU for large bodies.
+
+The publish handler (`TCPServer::publish_telemetry`) validates first, so the
+log never holds records the system cannot interpret, then appends the
+original bytes, updates `FleetState`, increments the accepted counter, and
+returns `{"offset":N}`. A rejected body increments
+`gateway_telemetry_rejected_total` and returns `400 {"error":"..."}`.
+
+`FleetState` (`src/telemetry/fleet_state.cpp`) maps `vehicle_id` to the
+latest event, its log offset, and when it arrived, behind a `shared_mutex`
+(reads from `/vehicles` and `/metrics` run in parallel; updates are
+exclusive). An update with a lower offset than the stored one is ignored, so
+two pool threads finishing out of order cannot move a vehicle backwards. A
+vehicle silent for longer than `vehicle_offline_seconds` is reported as
+`offline` while its own last status is kept as `reported_status`. The clock
+is injectable for deterministic tests. On startup the view is rebuilt from
+the recovered recent cache; each record's age is derived from its stored
+append timestamp so silent vehicles are still shown offline after a restart.
+It is a derived view: the log remains the source of truth.
+
+### 2.9 Consumer protocol, replay, and live streaming
+
+Consumers connect to `consumer_port` and speak the length-prefixed frames in
+[protocol.md](protocol.md) (`SUBSCRIBE`, `FETCH_FROM`, `DATA`, `ACK`,
+`ERROR`). `FrameDecoder` (`src/protocol/frame_codec.cpp`) buffers bytes until
+a complete frame is available, caps client frames at 1 KiB, and compacts its
+buffer as frames are consumed. Consumer traffic is handled on the epoll
+worker itself, not the pool: the work per frame is small, and it keeps all
+socket state thread-confined like the HTTP path.
+
+`MemoryMappedLog::read_from(offset, max_bytes)` serves replay. Offsets are
+global byte positions, so it binary-searches the segment index by first
+offset and computes the file position as `40 + (offset - first_offset)`. It
+copies the index under the log mutex, then reads with `pread` outside it,
+which is safe because bytes below the log end never change. Each record is
+checked for magic, matching offset, bounds, and CRC; an offset that is not a
+record boundary raises `invalid_argument`, which the server turns into an
+`ERROR` frame.
+
+`TCPServer::pump_consumer` fills a consumer's output queue from the log in
+64 KiB batches until about 256 KiB is queued or it has caught up, then
+flushes. If the kernel accepts everything, it loops and fills again; if the
+socket would block, `EPOLLOUT` resumes it later. (An earlier version returned
+after its first flush and could leave a consumer waiting forever during a
+large replay; see [journal.md](journal.md).) The already-sent prefix of the
+output buffer is reclaimed so long-lived streams do not grow memory.
+
+New records reach live consumers without new cross-thread machinery. Each
+worker registers its `LoopState`; after an append, the publishing pool thread
+sets that worker's `data_available` flag and writes its existing completion
+`eventfd`, only if the worker has consumers and only if the flag was not
+already set. The worker clears the flag before reading the log end, so a
+record appended while it pumps triggers another wake-up instead of being
+missed. A small registry (behind its own mutex) records each consumer's
+cursor and acknowledged offset for `GET /consumers` and the
+`gateway_consumer_lag_bytes` metric. A global counter enforces
+`max_consumers`; excess connections receive `ERROR "too many consumers"`.
+
+### 2.10 Dashboard serving
+
+`load_dashboard_files` (`src/http/static_files.cpp`) reads a fixed list of
+five files (`index.html`, `style.css`, `app.js`, `charts.js`,
+`fleet_map.js`) from `dashboard_directory` at startup, and each is
+registered as an exact route under `/dashboard/`, with `index.html` also at
+`/`. Because only exact routes exist, a path such as
+`/dashboard/../config.ini` can never reach the filesystem. Missing files are
+logged as a warning. Files are held in memory, so dashboard edits need a
+restart. The dashboard itself is plain HTML/CSS/JavaScript (Chart.js from a
+CDN is the only dependency); it polls `/metrics`, `/vehicles`, `/recent` and
+`/consumers`, draws the fleet on a canvas, and computes rates using the
+gateway's `process_uptime_seconds` as the time base.
+
+### 2.11 Python SDK and examples
+
+`python_sdk/gateway_client` (standard library only) provides `GatewayClient`:
+`send_telemetry` over HTTP, `subscribe_stream` and `replay` over the binary
+protocol, and `disconnect`. `subscribe_stream` saves each record's
+`next_offset` to an optional offset file (write-then-rename) after the
+callback returns, then sends `ACK`; on reconnect it resumes from that file,
+which gives at-least-once delivery. Connection errors are retried with
+exponential backoff. `examples/` contains a fleet simulator, a
+dispatch-monitor consumer, and a single-vehicle replay tool.
 
 ## 3. Load Testing and Container Support
 
@@ -153,7 +269,19 @@ of 100, 500, 1,000, 2,500, 5,000, 10,000, 20,000, 30,000, and 50,000
 concurrent HTTP clients. It samples metrics, triggers graceful shutdown with
 work in flight, restarts the gateway against stage-specific storage, and
 verifies every acknowledged write. Raw data is kept under ignored
-`build/backend-test-results/`; the measured report is `docs/tests.md`.
+`build/backend-test-results/`; the measured report is `docs/tests.md`. Since
+telemetry validation was added, the stage harness sends valid TelemetryEvent
+JSON (a unique `vehicle_id` per request); the recorded stage results predate
+that change.
+
+`tests/benchmarks/run_bench.sh` measures sustained throughput instead of
+burst capacity. For each combination of pool size, body size and connection
+count it starts a fresh gateway on an empty log, pins the gateway and `wrk`
+to separate CPU sets, warms up for 2 s, and records the median of three 8 s
+runs (requests/s and P50/P90/P99). `tests/benchmarks/telemetry.lua` makes
+every request a valid TelemetryEvent, padding larger bodies with an ignored
+field. `cache_vs_disk_bench` times recent-cache reads against `read_from`.
+Results and analysis are in [results.md](results.md) §6.
 
 The Final Testing Plan established pass criteria before each stage run:
 zero connection/send/response failures, zero `429`/`503` responses, zero parse
@@ -277,13 +405,20 @@ The executable currently registers these endpoints:
   task-queue length/high-water, per-worker accepted/request/completion counters,
   per-worker completion-queue depth/high-water, and `gateway_log_disk_bytes`.
   The latter is a gauge of provisioned segment-file bytes because segments are
-  pre-sized.
+  pre-sized. The fleet work added `gateway_telemetry_events_total`,
+  `gateway_telemetry_rejected_total`, `gateway_active_vehicles`,
+  `gateway_vehicles{status=...}`, `gateway_log_end_offset`,
+  `gateway_consumers_connected`, `gateway_consumer_records_sent_total`, and
+  `gateway_consumer_lag_bytes`. Consumer connections are counted by the
+  consumer gauge, not by `gateway_connections_active`.
 - `GET /recent` returns the configured number of newest messages from the
   in-memory circular cache as JSON.
 - `GET /large-response` returns a deterministic 512 KiB body for transport
   tests of slow readers and partial writes.
-- `POST /publish` appends a non-empty body as an opaque record and returns its
-  offset; it does not validate telemetry JSON.
+- `POST /publish` validates a TelemetryEvent, appends it, updates
+  `FleetState`, and returns `{"offset":N}`.
+- `GET /vehicles`, `GET /consumers`, and the dashboard routes are described
+  in [protocol.md](protocol.md).
 - `GET /test/hold` sleeps for 15 seconds and is registered only when
   `GATEWAY_TEST_MODE` is set for shutdown testing.
 
@@ -301,9 +436,8 @@ incremented after a client is accepted and decremented when that client is
 removed. This provides one safe aggregate value without reading another
 worker's map or adding locks to the normal connection path.
 
-The telemetry contract reserves `POST /publish` for telemetry JSON, but the
-current handler stores a non-empty body as an opaque record without JSON
-validation or downstream delivery.
+`POST /publish` accepts only valid TelemetryEvent JSON; consumers receive the
+stored records over the binary protocol (see [architecture.md](architecture.md)).
 
 The large-response endpoint is intentionally simple and deterministic. It is a
 transport test surface, not a telemetry feature: the body consists of repeated
@@ -357,7 +491,7 @@ The suite covers:
 - 100 concurrent raw-socket HTTP clients.
 - A slow reader consuming a 512 KiB response in small chunks.
 - `/recent` empty-cache JSON and query validation, plus `/metrics` exposition.
-- `/publish` empty-body rejection and opaque-body persistence visibility.
+- `/publish` empty-body rejection and visibility of a stored telemetry event.
 
 The last case uses `GET /large-response`, a deterministic transport-test
 endpoint that returns 512 KiB of `x` bytes. The client limits its receive
@@ -370,12 +504,24 @@ split writes.
 These tests complement the other test layers:
 
 ```text
-HTTPParser C++ unit tests       -> parser logic in isolation
-raw-socket HTTP integration     -> real TCP server, parser, router, responses
-slow-reader integration         -> partial writes and EPOLLOUT backpressure
+C++ unit tests (51 CTest cases)  -> parser, limiter, pool, config, metrics, log,
+                                    cache, telemetry validator, fleet state, frame codec
+raw-socket HTTP integration      -> real TCP server, parser, router, responses
+slow-reader integration          -> partial writes and EPOLLOUT backpressure
+pytest integration (33 cases)    -> real gateway process: publish validation,
+                                    fleet view, SDK replay/streaming, consumer
+                                    resume, dashboard whitelist
+pytest chaos (2 cases)           -> kill -9 durability, SIGTERM drain under load
 raw TCP connection-ramp test     -> connection retention
 backend HTTP stage test          -> concurrency, shutdown drain, and recovery
+wrk benchmark harness            -> sustained throughput and latency percentiles
 ```
+
+The pytest suites live in `tests/integration` and `tests/chaos`;
+`tests/conftest.py` starts a gateway on free local ports with its own
+storage directory and can stop, `kill -9`, and restart it. CI runs the C++
+and pytest suites in Release and again under AddressSanitizer +
+UndefinedBehaviorSanitizer.
 
 Focused C++ tests also cover config-file/CLI precedence, pool queue capacity and
 drain semantics, exception survival, concurrent same-IP rate limiting, and a
@@ -408,9 +554,15 @@ through the server API and checks default ordering, a limited count, zero count,
 invalid and over-limit counts, JSON escaping, response content type, configured
 segment-size metrics, and graceful response draining. `metrics_tests` checks
 that the disk gauge's help text describes provisioned bytes.
+`telemetry_event_tests`, `fleet_state_tests` and `frame_codec_tests` cover
+the validator, the fleet view (with a fake clock and an 8-thread concurrency
+case) and the consumer framing; `mmap_log_tests` also covers `read_from` and
+the CRC golden check. Per-case details are in [results.md](results.md) §2.2
+and §3.3.
 
-The integration suite verifies that `/publish` rejects an empty body and stores
-a non-empty opaque body. It does not validate telemetry JSON or field ranges.
+The Docker integration suite verifies that `/publish` rejects an empty body and
+stores a valid telemetry event. Field-level validation is covered by
+`telemetry_event_tests` and `tests/integration/test_telemetry_publish.py`.
 
 Run the staged backend test with:
 
@@ -435,7 +587,7 @@ Per-stage recovery and shutdown passed at all nine stages.
 
 ## 5. Telemetry Contract
 
-Telemetry is intended to be sent as JSON in the body of `POST /publish`. The
+Telemetry is sent as JSON in the body of `POST /publish`. The
 documented event shape is defined in [protocol.md](protocol.md):
 
 ```text
@@ -449,17 +601,19 @@ TelemetryEvent {
 }
 ```
 
-The current `POST /publish` implementation treats the body as an opaque string
-and appends it to persistent storage. JSON parsing, field validation, and
-downstream delivery remain future application work. This keeps HTTP framing
-separate from the meaning and policy of telemetry records.
+`POST /publish` parses the body with `parse_telemetry`
+(`src/telemetry/telemetry_event.cpp`): a flat JSON object, all six fields
+required with the types and ranges in [protocol.md](protocol.md), unknown
+scalar fields ignored. Valid bodies are appended byte-for-byte; invalid ones
+get `400 {"error":"<reason>"}` and never reach the log. HTTP framing stays in
+`HTTPParser`; the meaning of a record stays in the telemetry layer.
 
 No additional telemetry endpoint is needed. `POST /publish` is the intended
 application contract.
 
 The protocol boundary is intentional: producers speak HTTP to this parser,
-while Week 9 consumers will use a separate binary TCP protocol. Consumers will
-not speak HTTP. Keeping those protocols separate allows the producer-facing API
+while consumers use a separate binary TCP protocol (`src/protocol/`). Consumers
+do not speak HTTP. Keeping those protocols separate allows the producer-facing API
 and consumer-facing stream format to evolve independently.
 
 ## 6. Why This Overall Approach Was Chosen
@@ -472,8 +626,10 @@ The implementation favors a small number of clear ownership boundaries:
 - HTTP framing belongs to `HTTPParser`.
 - HTTP formatting belongs to `HttpResponse`.
 - Application dispatch belongs to `Router` and route handlers.
-- Telemetry validation and publish-route integration belong to the future
-  application layer; the durable log API is now implemented.
+- Telemetry validation belongs to `parse_telemetry`; the derived fleet view
+  belongs to `FleetState`.
+- Consumer framing belongs to `FrameDecoder`; replay reads belong to
+  `MemoryMappedLog::read_from`.
 
 This structure was chosen for four reasons:
 
@@ -493,9 +649,10 @@ in one callback.
 
 Implemented today:
 
-- CMake/C++17 build with compiler warnings.
+- CMake/C++17 build with compiler warnings, defaulting to Release.
 - Config-file and CLI runtime settings for port, backlog, epoll workers, pool
-  size, queue capacity, log path, and rate limiting.
+  size, queue capacity, log path, rate limiting, storage, consumer port and
+  cap, dashboard directory, and offline window (`--help` prints them).
 - IPv4 TCP listener setup and cleanup.
 - Centralized timestamped logging.
 - Nonblocking sockets and `EAGAIN` handling.
@@ -525,7 +682,7 @@ Implemented today:
 - Recent-message cache and `GET /recent`; log capacity gauge in `/metrics`.
 - Storage recovery, rollover, circular-cache, and recent-route test coverage.
 - A deterministic large-response endpoint for testing partial response writes.
-- Opaque-body `POST /publish` persistence route and opt-in shutdown hold route.
+- `POST /publish` persistence route (validated telemetry since the fleet work) and opt-in shutdown hold route.
 - Staged HTTP concurrency, graceful-shutdown, and persistence-recovery tests
   (100 through 50,000 concurrent clients; 9 stages, all passed).
 - Final Testing Plan with pre-run pass criteria, environment documentation,
@@ -533,14 +690,20 @@ Implemented today:
 - Telemetry event documentation.
 - Comprehensive test report in `docs/tests.md` and results summary in `docs/results.md`.
 
+Added by the fleet work (see [architecture.md](architecture.md)):
+
+- TelemetryEvent validation on `POST /publish`, `FleetState` and `GET /vehicles`.
+- Binary consumer protocol with replay (`read_from`), live tailing, ACKs,
+  backpressure, `GET /consumers`, and consumer metrics.
+- Dashboard served by the gateway; Python SDK; simulator, consumer and replay
+  examples.
+- pytest integration and chaos suites, `wrk` benchmark harness, CI.
+- Table-driven CRC32 and a Release default build (see [journal.md](journal.md)).
+
 Still to implement:
 
-- Validate telemetry JSON and its field ranges.
-- Connect validated `POST /publish` messages to persistent append and downstream delivery.
-- Add authentication, rate limiting, and spam/DDoS protection.
-- Add keep-alive or pipelining if required.
-- Add chunked transfer encoding if required.
-- Add application-level telemetry and failure tests.
-- Add inactive-IP bucket expiration and a bounded limiter map.
-- Add application-level telemetry tests after JSON validation and delivery are
-  implemented.
+- Authentication and TLS; broader spam/DDoS protection.
+- Inactive-IP bucket expiration and a bounded limiter map.
+- Asynchronous sync of sealed segments so rollover does not stall appends.
+- Log retention and consumer groups.
+- Keep-alive or pipelining, and chunked transfer encoding, if required.

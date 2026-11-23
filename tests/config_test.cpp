@@ -55,8 +55,50 @@ void config_rejects_invalid_values_and_unknown_keys() {
     assert(unknown_key_rejected);
 }
 
+void config_reads_fleet_and_consumer_settings() {
+    const std::string path = "/tmp/gateway-config-fleet-test.conf";
+    {
+        std::ofstream file(path);
+        file << "consumer_port=9191\nmax_consumers=8\n"
+                "dashboard_directory=/srv/dashboard\nvehicle_offline_seconds=45\n";
+    }
+    std::vector<std::string> arguments{"gateway", "--config", path,
+                                       "--vehicle-offline-seconds", "60"};
+    std::vector<char*> argv;
+    for (auto& argument : arguments) argv.push_back(argument.data());
+    const Config config = Config::from_args(static_cast<int>(argv.size()), argv.data());
+    std::remove(path.c_str());
+    assert(config.consumer_port == 9191);
+    assert(config.max_consumers == 8);
+    assert(config.dashboard_directory == "/srv/dashboard");
+    assert(config.vehicle_offline_seconds == 60);
+
+    const auto rejected = [](Config candidate) {
+        try {
+            candidate.validate();
+        } catch (const std::runtime_error&) {
+            return true;
+        }
+        return false;
+    };
+    Config disabled;
+    disabled.consumer_port = 0;  // 0 disables the consumer listener.
+    assert(!rejected(disabled));
+    Config clash;
+    clash.consumer_port = clash.port;
+    assert(rejected(clash));
+    Config negative;
+    negative.consumer_port = -1;
+    assert(rejected(negative));
+    Config no_window;
+    no_window.vehicle_offline_seconds = 0;
+    assert(rejected(no_window));
+}
+
 int main(int argc, char* argv[]) {
     TestRunner runner(argc, argv);
+    runner.run("config_reads_fleet_and_consumer_settings",
+               config_reads_fleet_and_consumer_settings);
     runner.run("config_reads_file_and_cli_overrides", config_reads_file_and_cli_overrides);
     runner.run("config_rejects_invalid_values_and_unknown_keys",
                config_rejects_invalid_values_and_unknown_keys);

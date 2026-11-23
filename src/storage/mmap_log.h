@@ -16,6 +16,12 @@ struct Message {
     std::string payload;
 };
 
+// Records returned by a replay read, plus where the next read should start.
+struct LogReadResult {
+    std::vector<Message> messages;
+    std::uint64_t next_offset = 0;
+};
+
 struct LogSegmentInfo {
     std::uint32_t segment_id = 0;
     std::uint64_t first_offset = 0;
@@ -42,6 +48,13 @@ public:
     void close();
 
     std::vector<Message> get_recent(std::size_t count) const;
+
+    // Read committed records starting at `offset`, which must be the offset of
+    // a record boundary (or the current end). Reading stops after roughly
+    // `max_bytes` of payload, but always returns at least one record when one
+    // exists. Throws std::out_of_range past the end and std::invalid_argument
+    // for an offset that is not a record boundary.
+    LogReadResult read_from(std::uint64_t offset, std::size_t max_bytes = 64 * 1024) const;
     std::vector<LogSegmentInfo> segments() const;
     std::uint64_t disk_usage_bytes() const;
     std::uint64_t next_offset() const;
