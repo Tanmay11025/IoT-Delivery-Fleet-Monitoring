@@ -190,3 +190,16 @@ add_case_tests(fleet_state_tests
 	fleet_state_json_lists_vehicles_and_counts
 	fleet_state_handles_concurrent_updates
 )
+
+add_executable(frame_codec_tests
+	tests/frame_codec_test.cpp
+	src/protocol/frame_codec.cpp
+)
+target_include_directories(frame_codec_tests PRIVATE src)
+target_compile_options(frame_codec_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_case_tests(frame_codec_tests
+	frame_codec_encodes_big_endian_frames
+	frame_codec_reassembles_fragmented_frames
+	frame_codec_splits_several_frames_from_one_read
+	frame_codec_rejects_invalid_frames
+)
