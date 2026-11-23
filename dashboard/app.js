@@ -63,11 +63,15 @@
   }
 
   function renderMetrics(m) {
-    const now = performance.now();
+    // Use the gateway's own uptime as the time base: counter and clock come
+    // from the same scrape, so the rate is right even when the browser
+    // throttles timers in a background tab. A restart resets uptime and
+    // counters, which the >= checks below skip.
+    const now = m["process_uptime_seconds"] || 0;
     const events = m["gateway_telemetry_events_total"] || 0;
     let eps = 0;
     if (previousEvents !== null && now > previousTime && events >= previousEvents) {
-      eps = (events - previousEvents) / ((now - previousTime) / 1000);
+      eps = (events - previousEvents) / (now - previousTime);
     }
     previousEvents = events;
     previousTime = now;

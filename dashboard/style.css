@@ -15,6 +15,10 @@
 
 * { box-sizing: border-box; }
 
+/* Author rules such as `.empty { display: flex }` would otherwise override the
+   browser's default for the hidden attribute and keep overlays visible. */
+[hidden] { display: none !important; }
+
 body {
   margin: 0;
   background: var(--bg);
