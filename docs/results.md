@@ -38,33 +38,39 @@ Later runs (2026-11-24, after the fleet features; Release build):
 
 ### 2.1 Full suite
 
-The full 31-case C++ CTest suite was run with:
+The full C++ suite has 51 CTest cases across 11 test executables. Latest
+run (2026-11-24, Release build):
 
 ```bash
-cmake -S . -B build
-cmake --build build --parallel 2
+cmake -S . -B build            # defaults to Release
+cmake --build build -j"$(nproc)"
 ctest --test-dir build --output-on-failure
 ```
 
-Result:
-
 ```text
-100% tests passed, 0 tests failed out of 31
-Total Test time (real) = 0.23 sec
+100% tests passed, 0 tests failed out of 51
+Total Test time (real) = 0.27 sec
 ```
+
+The same 51 cases also pass in a Debug build with AddressSanitizer and
+UndefinedBehaviorSanitizer (the CI `sanitizers` job). The 2026-10-18 staged
+run in §4 used the 31 cases that existed at the time.
 
 ### 2.2 Covered behaviors
 
-| Test target | Behaviors verified |
-| --- | --- |
-| `http_parser_tests` | Fragmented headers and bodies; `Content-Length` completion; requests without bodies; case-insensitive header lookup; query/path separation; malformed requests; conflicting lengths; unsupported chunked encoding; header/body size limits |
-| `rate_limiter_tests` | Fake-clock token-bucket burst/refill/cap; zero-rate behavior; independent IP buckets; `429` handler bypass; concurrent same-IP consumption capped at capacity |
-| `metrics_tests` | Connection lifecycle; request/blocked counts; response classes; duration histogram; parse errors; process uptime; log disk-byte gauge |
-| `config_tests` | Config-file parsing; CLI override precedence; invalid-value rejection; unknown-key rejection |
-| `thread_pool_tests` | Fixed worker stats; bounded-queue rejection; rejection after shutdown starts; draining of accepted tasks; continued worker operation after a task throws |
-| `tcp_server_drain_tests` | Three messages appended through API; chronological ordering in `/recent`; `count=1` selects only the newest; JSON escaping; `count=0` and `count=1001` boundary validation; `gateway_log_disk_bytes` in `/metrics`; in-flight handler released after SIGTERM; response delivered before server thread joins; `gateway_thread_pool_workers` present in post-shutdown exposition |
-| `mmap_log_tests` | Append/read across close and reopen; variable and empty payloads; global offsets across segment rollover; exact-fit rollover; oversized-record rejection; incomplete-header/payload recovery; payload bytes before a missing header; active-tail checksum rejection; fatal corruption in a sealed segment |
-| `circular_buffer_tests` | Chronological reads before and after wraparound; exact-capacity fills; zero/oversized reads; capacity-one replacement |
+| Test target | Cases | Behaviors verified |
+| --- | ---: | --- |
+| `http_parser_tests` | 5 | Fragmented headers and bodies; `Content-Length` completion; requests without bodies; case-insensitive header lookup; query/path separation; malformed requests; conflicting lengths; unsupported chunked encoding; header/body size limits |
+| `rate_limiter_tests` | 6 | Fake-clock token-bucket burst/refill/cap; zero-rate behavior; independent IP buckets; `429` handler bypass; concurrent same-IP consumption capped at capacity |
+| `metrics_tests` | 4 | Connection lifecycle; request/blocked counts; response classes; duration histogram; parse errors; process uptime; log disk-byte gauge; telemetry accepted/rejected counters; vehicle gauges; consumer count, records sent and lag |
+| `config_tests` | 3 | Config-file parsing; CLI override precedence; invalid-value rejection; unknown-key rejection; `consumer_port` (including 0 = disabled and clash with `port`), `max_consumers`, `dashboard_directory`, `vehicle_offline_seconds` |
+| `thread_pool_tests` | 2 | Fixed worker stats; bounded-queue rejection; rejection after shutdown starts; draining of accepted tasks; continued worker operation after a task throws |
+| `tcp_server_drain_tests` | 1 | Three messages appended through API; chronological ordering in `/recent`; `count=1` selects only the newest; JSON escaping; `count=0` and `count=1001` boundary validation; `gateway_log_disk_bytes` in `/metrics`; in-flight handler released after SIGTERM; response delivered before server thread joins; `gateway_thread_pool_workers` present in post-shutdown exposition |
+| `mmap_log_tests` | 10 | Append/read across close and reopen; variable and empty payloads; global offsets across segment rollover; exact-fit rollover; oversized-record rejection; incomplete-header/payload recovery; payload bytes before a missing header; active-tail checksum rejection; fatal corruption in a sealed segment; `read_from` across segments, mid-segment starts, byte budgets, end/past-end/non-boundary offsets and after reopen; on-disk CRCs equal a reference CRC-32/IEEE (`"123456789"` → `0xCBF43926`) |
+| `circular_buffer_tests` | 4 | Chronological reads before and after wraparound; exact-capacity fills; zero/oversized reads; capacity-one replacement |
+| `telemetry_event_tests` | 6 | Valid event; field order, whitespace and ignored unknown scalar fields; `\uXXXX` escapes; missing and mistyped fields; range checks (lat, lng, speed, status, vehicle_id charset/length, timestamp); malformed JSON (trailing data, duplicate keys, nesting, bad numbers, raw control characters, lone surrogates, oversize body) |
+| `fleet_state_tests` | 6 | Latest report per vehicle; out-of-order reports ignored by offset; offline after the silence window (fake clock); age restored when rebuilt from the log; JSON output and counts; 8 threads updating concurrently keep each vehicle's highest offset |
+| `frame_codec_tests` | 4 | Big-endian encoding of FETCH_FROM and DATA; reassembly from one-byte reads; several frames in one read; zero length, oversized and unknown-type frames rejected |
 
 ---
 
@@ -72,7 +78,9 @@ Total Test time (real) = 0.23 sec
 
 Run with `./scripts/run_http_integration_test.sh`. Docker Compose starts the compiled gateway and a Python `python:3.12-alpine` test container. The gateway's rate-limit override (`--rate-limit-capacity 1000 --rate-limit-refill-rate 0`) prevents the shared container IP from exhausting the token bucket.
 
-**Result: 13/13 passed.**
+**Result: 13/13 passed**, both on 2026-10-18 and again on 2026-11-24 after
+telemetry validation was added (the publish case now sends a valid
+TelemetryEvent). Output of the 2026-11-24 run:
 
 ```text
 PASS test_health_request
@@ -87,12 +95,14 @@ PASS test_concurrent_clients
 PASS test_slow_reader_partial_response
 PASS test_recent_endpoint
 PASS test_metrics_endpoint
-PASS test_publish_endpoint
+PASS test_publish_appends_and_recent_recovers_message
 PASS all HTTP integration tests (13)
 http-test exited with code 0
 ```
 
-The gateway's exit code `137` during Compose teardown is expected (`SIGKILL` from `--abort-on-container-exit`) and is not a test failure.
+In the 2026-10-18 run the gateway container exited with `137` during Compose
+teardown (`SIGKILL` from `--abort-on-container-exit`), which is not a test
+failure. In the 2026-11-24 runs it exited with `0`.
 
 ### 3.1 What the results demonstrate
 
@@ -106,17 +116,42 @@ The gateway's exit code `137` during Compose teardown is expected (`SIGKILL` fro
 - A slow reader receives a complete 512 KiB response through the outbound queue and `EPOLLOUT` path.
 - `/metrics` returns Prometheus text with the expected content type and all required samples; request counters and histogram counts advance correctly across scrapes.
 - `/recent` returns an empty array on a fresh server, validates count parameters, and returns the correct chronological set.
-- `/publish` rejects an empty body with `400`; a non-empty body returns `201 Created` and the record is immediately visible through `/recent`.
+- `/publish` rejects an empty body with `400`; a valid TelemetryEvent returns `201 Created` with `{"offset":N}` and is immediately visible through `/recent`.
 
 ### 3.2 Troubleshooting note — rate limiter vs. integration tests
 
 The first HTTP integration run after adding per-IP rate limiting failed: all test clients shared the same Docker container IP, so earlier tests consumed the default 10-token bucket. Subsequent tests received `429 Too Many Requests`. Binding clients to different loopback addresses was not portable inside the Alpine network namespace. The final fix was to configure the integration Compose service with a large capacity and zero refill rate. This preserves the production default while making transport-layer tests independent of the rate-limiting policy.
+
+### 3.3 pytest integration and chaos suites (2026-11-24)
+
+Run with `python3 -m pytest`. Each test starts a real `message_gateway`
+process on free local ports with its own storage directory
+(`tests/conftest.py`), so they test the binary end to end, including
+restarts and crashes.
+
+**Result: 35/35 passed** (about 9 s). The earlier 34-case suite also passed 5
+consecutive repeat runs, and the 33 integration cases pass against the
+ASan/UBSan build.
+
+| File | Cases | What it checks |
+| --- | ---: | --- |
+| `integration/test_telemetry_publish.py` | 10 | Valid event stored and shown in `/vehicles`, `/recent`, metrics; 6 invalid bodies get `400` with the exact reason and change nothing; SDK raises `ValidationError`; latest event wins per vehicle; fleet view identical after restart |
+| `integration/test_sdk_roundtrip.py` | 9 | Replay returns every record in order with chained `next_offset`; replay from the middle; ~2 MB replay (many times the 256 KiB queue) completes; live subscriber gets exactly the new records; ACKs reach `/consumers` with zero lag; request frames split across sends and responses read 7 bytes at a time; non-boundary and past-end offsets get `ERROR`; a consumer sending `DATA` gets `ERROR` and is closed |
+| `integration/test_consumer_reconnect.py` | 2 | Consumer "crashes" after 40 of 100 records and a new process resumes from the offset file with no gap and no duplicate; gateway `kill -9` + restart while a consumer streams, and all 100 records are still delivered |
+| `integration/test_dashboard_static.py` | 12 | `/` and the 5 whitelisted assets served with correct content types; 6 traversal or unknown paths return `404` |
+| `chaos/test_kill9.py` | 1 | 4 publishers × 250 events; `kill -9` after 600 acknowledgements; after restart every acknowledged record is present byte-for-byte, each vehicle's position is at least as new as its last acknowledged report, and appends continue at the right offset |
+| `chaos/test_graceful_shutdown.py` | 1 | SIGTERM while 4 publishers send and a consumer streams; exit code 0; consumer sees a clean end of stream; every acknowledged record recovered |
+
+The large-replay case was checked against the bug it guards: with the old
+pump behaviour it failed ("replay stalled after 260 of 2000 records").
 
 ---
 
 ## 4. Staged HTTP Concurrency Results
 
 Run with `python3 scripts/run_backend_tests.py`. The runner sequenced all nine stages. Each stage opened N connections, sent `POST /publish` to N-1 clients and `GET /test/hold` to one, then triggered shutdown and verified recovery.
+
+These results are from the 2026-10-18 run, when `/publish` stored opaque bodies. The harness (`tests/backend_load_stage.py`) has since been changed to send valid TelemetryEvent JSON so it still passes validation. **The staged test has not been re-run since that change**, so the table below still reflects the October build.
 
 ### 4.1 Summary table
 
