@@ -158,3 +158,35 @@ add_case_tests(circular_buffer_tests
 	circular_buffer_handles_exact_capacity_and_zero_count
 	circular_buffer_supports_capacity_one
 )
+
+add_executable(telemetry_event_tests
+	tests/telemetry_event_test.cpp
+	src/telemetry/telemetry_event.cpp
+)
+target_include_directories(telemetry_event_tests PRIVATE src)
+target_compile_options(telemetry_event_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_case_tests(telemetry_event_tests
+	telemetry_accepts_a_valid_event
+	telemetry_accepts_whitespace_order_and_unknown_scalar_fields
+	telemetry_decodes_string_escapes
+	telemetry_rejects_missing_and_mistyped_fields
+	telemetry_rejects_out_of_range_values
+	telemetry_rejects_malformed_json
+)
+
+add_executable(fleet_state_tests
+	tests/fleet_state_test.cpp
+	src/telemetry/telemetry_event.cpp
+	src/telemetry/fleet_state.cpp
+)
+target_include_directories(fleet_state_tests PRIVATE src)
+target_compile_options(fleet_state_tests PRIVATE -Wall -Wextra -Wpedantic)
+target_link_libraries(fleet_state_tests PRIVATE Threads::Threads)
+add_case_tests(fleet_state_tests
+	fleet_state_keeps_the_latest_report_per_vehicle
+	fleet_state_ignores_reports_that_arrive_out_of_order
+	fleet_state_marks_silent_vehicles_offline
+	fleet_state_restores_age_when_rebuilt_from_the_log
+	fleet_state_json_lists_vehicles_and_counts
+	fleet_state_handles_concurrent_updates
+)
