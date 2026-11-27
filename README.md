@@ -1,9 +1,5 @@
 # IoT Delivery Fleet Monitoring
 
-[![CI](https://github.com/Tanmay11025/IoT-Delivery-Fleet-Monitoring/actions/workflows/ci.yml/badge.svg)](https://github.com/Tanmay11025/IoT-Delivery-Fleet-Monitoring/actions/workflows/ci.yml)
-![C++17](https://img.shields.io/badge/C%2B%2B-17-blue)
-![Linux](https://img.shields.io/badge/platform-Linux-lightgrey)
-
 A live telemetry platform for delivery vans, built from scratch in C++17 on
 Linux. Vans publish position and status over HTTP. The gateway validates each
 report and appends it to a crash-safe log. A built-in dashboard shows the
