@@ -15,9 +15,84 @@ loop per core in front of a worker pool), **Kafka** (a segmented, offset-indexed
 append-only log with replay and at-least-once consumers) and **Prometheus**
 (a `/metrics` endpoint plus a dashboard).
 
+## How to run
+
+You need Linux (developed on Ubuntu), a C++17 compiler, CMake 3.16 or newer,
+and Python 3. Nothing else: the Python examples use only the standard
+library, and the dashboard is served by the gateway itself (its two charts
+load Chart.js from a CDN; the map and tables work offline).
+
+**1. Install the tools and build** (once):
+
+```bash
+sudo apt install build-essential cmake python3
+git clone https://github.com/Tanmay11025/IoT-Delivery-Fleet-Monitoring.git
+cd IoT-Delivery-Fleet-Monitoring
+cmake -S . -B build && cmake --build build -j"$(nproc)"
+```
+
+**2. Start the gateway** (terminal 1):
+
+```bash
+./build/message_gateway --config config.demo.ini
+```
+
+It serves HTTP and the dashboard on port 8080 and the consumer protocol on
+port 9090, and stores the log in `data/log`. `config.demo.ini` raises the
+per-IP rate limit, because every simulated van publishes from the same
+machine.
+
+**3. Start the simulated fleet** (terminal 2):
+
+```bash
+python3 examples/fleet_simulator.py --vehicles 500
+```
+
+Vans drive the streets of a fictional 6 x 3.4 km city on delivery rounds from
+four depots, reporting once a second. One simulator process handles up to
+about 1,000 vans.
+
+**4. Open the dashboard** at <http://localhost:8080/> (or run
+`xdg-open http://localhost:8080/`).
+
+- Vans glide along the streets about 2 seconds behind real time: green
+  arrows are moving, yellow dots are stopped at a delivery or depot, and red
+  vans have stopped reporting.
+- **Scroll** over the map to zoom (25% per wheel notch), **drag** to pan,
+  **double-click** to reset the view. Street names appear as you zoom in.
+- Hover over a van to see its speed, position and last report.
+
+**5. Optional extras** (terminal 3):
+
+```bash
+# A dispatch monitor that alerts on speeding (> 50 km/h) or silent vans and
+# resumes from its offset file after a restart
+python3 examples/fleet_consumer.py --speed-limit 50 --offset-file dispatch.offset
+
+# Afterwards: where was one van, and when?
+python3 examples/replay_vehicle.py --vehicle van-00003
+```
+
+**6. Stop** with **Ctrl+C** in each terminal. The gateway shuts down cleanly,
+and on the next start it recovers everything already in `data/log`. Delete
+that directory to start from an empty log.
+
+**If something goes wrong:**
+
+| Symptom | Fix |
+| --- | --- |
+| `Port 8080 is already in use by another process` | Another gateway is still running. Stop it (`pkill -f message_gateway`) and start again. |
+| Simulator prints a growing `rate_limited` count | Start the gateway with `--config config.demo.ini`; `config.example.ini` keeps strict per-IP limits. |
+| Dashboard changes do not appear | The gateway reads the dashboard files at startup: restart it, then hard-reload the page (Ctrl+Shift+R). |
+| `No vehicles yet` on the map | The simulator is not running, or it points at a different port (`--http-port`). |
+
+`config.example.ini` keeps the strict production-style defaults (10-token
+bucket, 5 tokens/s per IP). Every setting can also be overridden with a CLI
+flag (`./build/message_gateway --help` prints them).
+
 ![Fleet Ops dashboard](docs/images/dashboard.png)
 
-<!-- To refresh: run the Quick start below, then capture the browser window. -->
+<!-- To refresh: follow How to run above, then capture the browser window. -->
 
 ## Highlights
 
@@ -61,34 +136,7 @@ schema, binary frames byte by byte).
 | Concurrency | thread pool + condition variable, `shared_mutex`, per-worker ownership with no locks on the socket path | `src/network/thread_pool.h`, `src/telemetry/fleet_state.cpp` |
 | Data structures | token bucket, ring buffer, hash maps, binary search over the segment index | `src/security`, `src/storage` |
 | Storage and reliability | append-only segments, CRC32, torn-tail recovery, offset replay, at-least-once consumers | `src/storage/mmap_log.cpp` |
-| Testing | 51 C++ tests, 35 pytest integration/chaos tests, 13 Docker HTTP tests, `wrk` benchmarks, ASan/UBSan in CI | `tests/` |
-
-## Quick start (Ubuntu)
-
-```bash
-sudo apt install build-essential cmake python3
-cmake -S . -B build && cmake --build build -j"$(nproc)"
-
-# Terminal 1: gateway with demo-sized rate limits (all simulated vans share one IP)
-./build/message_gateway --config config.demo.ini
-
-# Terminal 2: 40 simulated vans driving around central London
-python3 examples/fleet_simulator.py --vehicles 40
-
-# Browser: the dashboard
-xdg-open http://localhost:8080/
-
-# Terminal 3: a dispatch monitor that alerts on speeding or silent vans and
-# resumes from its offset file after a restart
-python3 examples/fleet_consumer.py --speed-limit 70 --offset-file dispatch.offset
-
-# Afterwards: where was one van, and when?
-python3 examples/replay_vehicle.py --vehicle van-00003
-```
-
-`config.example.ini` keeps the strict defaults (10-token bucket, 5 tokens/s
-per IP). Every setting can also be overridden with a CLI flag
-(`./build/message_gateway --help` prints them).
+| Testing | 51 C++ tests, 38 pytest integration/chaos tests, 13 Docker HTTP tests, `wrk` benchmarks, ASan/UBSan in CI | `tests/` |
 
 ## Python SDK
 
@@ -129,7 +177,7 @@ full and at shutdown. This is a deliberate throughput trade-off (see
 
 ```bash
 ctest --test-dir build                       # 51 C++ unit tests
-pip install pytest && python3 -m pytest     # 35 integration + chaos tests (starts real gateways)
+pip install pytest && python3 -m pytest     # 38 integration + chaos tests (starts real gateways)
 bash scripts/run_http_integration_test.sh    # 13 raw-socket HTTP tests in Docker
 python3 scripts/run_backend_tests.py         # staged 100 → 50,000 client burst test
 tests/benchmarks/run_bench.sh                # wrk throughput matrix

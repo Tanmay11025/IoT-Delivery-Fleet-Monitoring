@@ -64,7 +64,11 @@ that reused the same file descriptor.
 ### 2.5 Epoll workers and request pool
 
 `SO_REUSEPORT` distributes newly accepted connections among the configured
-epoll workers. Those workers keep all connection mutation and socket I/O
+epoll workers. Because `SO_REUSEPORT` would equally let a *second* gateway
+process bind the same port and silently take part of the traffic, `start()`
+first probes the HTTP and consumer ports with a socket bound without it; if
+either is already in use, the gateway exits with an error before opening its
+log. Those workers keep all connection mutation and socket I/O
 thread-confined. Once an HTTP request is complete, the epoll worker submits a
 copy of the request and client IP to one shared, fixed-size `ThreadPool`. Its
 bounded queue rejects excess work with `503 Service Unavailable`. Pool threads
@@ -225,16 +229,26 @@ cursor and acknowledged offset for `GET /consumers` and the
 ### 2.10 Dashboard serving
 
 `load_dashboard_files` (`src/http/static_files.cpp`) reads a fixed list of
-five files (`index.html`, `style.css`, `app.js`, `charts.js`,
-`fleet_map.js`) from `dashboard_directory` at startup, and each is
+six files (`index.html`, `style.css`, `app.js`, `charts.js`,
+`fleet_map.js`, `city_map.json`) from `dashboard_directory` at startup, and each is
 registered as an exact route under `/dashboard/`, with `index.html` also at
 `/`. Because only exact routes exist, a path such as
 `/dashboard/../config.ini` can never reach the filesystem. Missing files are
 logged as a warning. Files are held in memory, so dashboard edits need a
 restart. The dashboard itself is plain HTML/CSS/JavaScript (Chart.js from a
-CDN is the only dependency); it polls `/metrics`, `/vehicles`, `/recent` and
-`/consumers`, draws the fleet on a canvas, and computes rates using the
-gateway's `process_uptime_seconds` as the time base.
+CDN is the only dependency); it polls `/vehicles` every 500 ms and `/metrics`, `/recent` and
+`/consumers` every second, and computes rates using the gateway's
+`process_uptime_seconds` as the time base. The fleet map draws the streets of
+a fictional 6 x 3.4 km city (`city_map.json`, about 420 junctions and 177 km
+of street, produced by `scripts/generate_city_map.py`), which
+`examples/fleet_simulator.py` also routes its vans on: each van works
+delivery rounds of 6-14 nearby addresses from one of four depots. The map can
+be zoomed (scroll) and panned (drag); street names appear once they fit. Each van report is placed on a timeline at the moment the
+gateway received it (poll time minus `age_seconds`), and the map is drawn
+1.8 s behind real time, interpolating every van between the two reports
+around that instant. Vans therefore move smoothly at 60 fps but only ever
+through positions they actually reported; gaps over 4 s (lost signal) jump
+instead of gliding.
 
 ### 2.11 Python SDK and examples
 

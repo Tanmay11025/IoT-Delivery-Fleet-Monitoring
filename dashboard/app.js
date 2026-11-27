@@ -1,13 +1,15 @@
 // Polls the gateway and updates the dashboard.
 //
-// Browser -> GET /metrics, /vehicles (every second)
+// Browser -> GET /vehicles (every 500 ms, feeds the live map)
+//         -> GET /metrics (every second)
 //         -> GET /recent, /consumers (every other second)
-// Each poll waits for the previous one to finish, so a slow gateway is never
-// hit by overlapping requests from the dashboard it is serving.
+// Each loop waits for its previous request to finish, so a slow gateway is
+// never hit by overlapping requests from the dashboard it is serving.
 (function () {
   "use strict";
 
   const POLL_MS = 1000;
+  const VEHICLE_POLL_MS = 500;
   const $ = (id) => document.getElementById(id);
 
   const map = new window.FleetMap($("fleet-map"), $("map-tooltip"), $("map-empty"));
@@ -108,8 +110,14 @@
     vehiclesChart.push(active);
   }
 
-  function renderVehicles(data) {
-    map.update(data.vehicles);
+  let lastTableRender = 0;
+
+  function renderVehicles(data, receivedAt) {
+    map.update(data.vehicles, receivedAt);
+    // The map wants every report; the table (which may hold thousands of
+    // rows) only needs refreshing once a second.
+    if (receivedAt - lastTableRender < 900) return;
+    lastTableRender = receivedAt;
     $("vehicle-count").textContent = `${data.counts.total} known`;
     const rows = data.vehicles.map((v) =>
       `<tr><td>${escapeHtml(v.vehicle_id)}</td><td>${badge(v.status)}</td>` +
@@ -159,10 +167,7 @@
   async function poll() {
     tick += 1;
     try {
-      const [metricsText, vehiclesText] = await Promise.all([
-        getText("/metrics"), getText("/vehicles")]);
-      renderMetrics(parsePrometheus(metricsText));
-      renderVehicles(JSON.parse(vehiclesText));
+      renderMetrics(parsePrometheus(await getText("/metrics")));
       // The tables change slowly; refresh them every other tick.
       if (tick % 2 === 1) {
         const [recentText, consumersText] = await Promise.all([
@@ -182,5 +187,19 @@
     }
   }
 
+  // The map interpolates between reports, so it wants them promptly; see
+  // fleet_map.js. Connection state is tracked by the main loop.
+  async function pollVehicles() {
+    try {
+      const text = await getText("/vehicles");
+      renderVehicles(JSON.parse(text), performance.now());
+    } catch (error) {
+      console.warn("vehicle poll failed:", error.message);
+    } finally {
+      setTimeout(pollVehicles, VEHICLE_POLL_MS);
+    }
+  }
+
   poll();
+  pollVehicles();
 })();

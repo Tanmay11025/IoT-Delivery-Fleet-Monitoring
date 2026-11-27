@@ -16,6 +16,7 @@ def test_index_is_served_at_root(gateway):
     ("/dashboard/app.js", "text/javascript"),
     ("/dashboard/charts.js", "text/javascript"),
     ("/dashboard/fleet_map.js", "text/javascript"),
+    ("/dashboard/city_map.json", "application/json"),
 ])
 def test_dashboard_assets_are_served(gateway, path, content_type):
     status, headers, body = gateway.request("GET", path)

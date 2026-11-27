@@ -17,7 +17,7 @@ Later runs (2026-11-24, after the fleet features; Release build):
 | Test category | Outcome |
 | --- | --- |
 | C++ CTest (51 cases) | **51/51 passed** (also under ASan + UBSan) |
-| pytest integration + chaos (35 cases) | **35/35 passed** (the earlier 34-case suite also passed 5 repeat runs) |
+| pytest integration + chaos (38 cases) | **38/38 passed** (the earlier 34-case suite also passed 5 repeat runs) |
 | Docker HTTP integration (13 cases) | **13/13 passed** |
 | `kill -9` during publishing | **every acknowledged record recovered** |
 | Sustained throughput (54 `wrk` runs) | **~77,000 events/s at 1.03 ms P99** (120 B); **0 errors** |

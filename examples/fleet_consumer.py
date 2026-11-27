@@ -6,7 +6,7 @@ van, and prints an alert when a van exceeds the speed limit or has been
 silent for longer than the offline window. With --offset-file it resumes
 after a restart from the last record it processed (at-least-once delivery).
 
-    python3 examples/fleet_consumer.py --speed-limit 70 --offset-file dispatch.offset
+    python3 examples/fleet_consumer.py --speed-limit 50 --offset-file dispatch.offset
 """
 
 from __future__ import annotations
@@ -67,7 +67,7 @@ def main() -> None:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--http-port", type=int, default=8080)
     parser.add_argument("--consumer-port", type=int, default=9090)
-    parser.add_argument("--speed-limit", type=float, default=70.0)
+    parser.add_argument("--speed-limit", type=float, default=50.0)
     parser.add_argument("--offline-after", type=float, default=30.0)
     parser.add_argument("--offset-file", default=None,
                         help="persist progress here and resume from it on restart")

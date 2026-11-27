@@ -67,6 +67,7 @@
       <div class="card map-card">
         <div class="card-head">
           <h2>Fleet map</h2>
+          <span class="hint" title="Vans glide between the positions they reported, drawn about 2 seconds behind real time. Scroll to zoom, drag to pan, double-click to reset.">live · ~2 s delay · scroll to zoom, drag to pan</span>
           <div class="legend">
             <span><i class="dot moving"></i>moving</span>
             <span><i class="dot idle"></i>idle</span>
@@ -122,8 +123,8 @@
   </main>
 
   <footer>
-    Data from <code>/metrics</code>, <code>/vehicles</code>, <code>/recent</code> and
-    <code>/consumers</code>, polled every second.
+    Data from <code>/vehicles</code> (polled every 500 ms), <code>/metrics</code>,
+    <code>/recent</code> and <code>/consumers</code> (every second).
   </footer>
 </body>
 </html>
