@@ -7,8 +7,10 @@
 A live telemetry platform for delivery vans, built from scratch in C++17 on
 Linux. Vans publish position and status over HTTP. The gateway validates each
 report and appends it to a crash-safe log. A built-in dashboard shows the
-fleet on a live map, and downstream services replay or stream every report
-over a binary protocol, resuming exactly where they stopped after a crash.
+fleet live on a zoomable street map, and downstream services replay or stream
+every report over a binary protocol, resuming exactly where they stopped after
+a crash. The included simulator drives hundreds of delivery vans along the
+roads of a fictional city to show it all working.
 
 In design terms, it is a small combination of **Nginx** (an epoll event
 loop per core in front of a worker pool), **Kafka** (a segmented, offset-indexed
@@ -90,12 +92,23 @@ that directory to start from an empty log.
 bucket, 5 tokens/s per IP). Every setting can also be overridden with a CLI
 flag (`./build/message_gateway --help` prints them).
 
-![Fleet Ops dashboard](docs/images/dashboard.png)
+![Fleet Ops dashboard: 500 simulated vans on the city map](docs/images/dashboard.png)
 
-<!-- To refresh: follow How to run above, then capture the browser window. -->
+Zoomed in, each van is an arrow in its lane, gliding between the positions it
+reported:
+
+![Fleet map zoomed in on the river embankment](docs/images/dashboard-zoom.png)
+
+<!-- To refresh: follow How to run above, then capture the browser window
+     (1440 x 1250 for dashboard.png; the map panel at ~9x zoom for
+     dashboard-zoom.png). -->
 
 ## Highlights
 
+- **A live city simulation:** vans drive delivery rounds along the streets of
+  a fictional 6 x 3.4 km city (traffic lights, corners, queues), and the
+  dashboard animates every van smoothly at 60 fps from its real reports, with
+  scroll-to-zoom down to street level
 - **~77,000 validated telemetry events/s** at 1.03 ms P99
   (120-byte events, 100 connections, 4 pool threads, one laptop) ·
   [benchmark report](docs/results.md#6-sustained-throughput-benchmark)
@@ -197,9 +210,12 @@ src/
   storage/     MemoryMappedLog, CircularBuffer
   security/    TokenBucket, RateLimiter
   monitoring/  Prometheus metrics
-dashboard/     Fleet Ops dashboard (HTML/CSS/vanilla JS + Chart.js)
+dashboard/     Fleet Ops dashboard (HTML/CSS/vanilla JS + Chart.js) and
+               city_map.json, the street map shared with the simulator
 python_sdk/    gateway_client package
-examples/      fleet_simulator.py, fleet_consumer.py, replay_vehicle.py
+examples/      fleet_simulator.py (vans on the city roads), fleet_consumer.py,
+               replay_vehicle.py
+scripts/       generate_city_map.py, load-test and integration-test runners
 tests/         C++ unit tests, integration/, chaos/, benchmarks/
 docs/          architecture, protocol, performance results, journal, test reports
 ```
