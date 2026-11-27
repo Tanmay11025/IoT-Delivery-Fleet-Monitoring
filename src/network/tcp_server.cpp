@@ -3,6 +3,7 @@
 #include "../core/json_util.h"
 #include "../telemetry/telemetry_event.h"
 
+#include <cerrno>
 #include <charconv>
 #include <sys/eventfd.h>
 
@@ -45,6 +46,26 @@ bool set_nonblocking(int fd) {
     }
 
     return true;
+}
+
+// True if no other socket is listening on the port. The workers' listeners
+// use SO_REUSEPORT, which would also let a second gateway bind the same port
+// and silently receive half the traffic. A probe bound without SO_REUSEPORT
+// is refused by any existing listener, so it detects that case. SO_REUSEADDR
+// keeps leftover TIME_WAIT connections from a restart from counting.
+bool port_is_free(int port) {
+    const int probe = socket(AF_INET, SOCK_STREAM, 0);
+    if (probe == -1) return true;  // Let the real bind report the problem.
+    int option = 1;
+    setsockopt(probe, SOL_SOCKET, SO_REUSEADDR, &option, sizeof(option));
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_port = htons((uint16_t)(port));
+    address.sin_addr.s_addr = htonl(INADDR_ANY);
+    const bool in_use = bind(probe, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == -1 &&
+                        errno == EADDRINUSE;
+    close(probe);
+    return !in_use;
 }
 
 int create_reuseport_listener(int port, int backlog) {
@@ -117,6 +138,16 @@ bool TCPServer::start() {
     shutdown_requested.store(false, memory_order_relaxed);
     worker_failed.store(false, memory_order_relaxed);
     metrics.set_epoll_worker_count(epoll_worker_count);
+    // Refuse to share a port with another process (for example a gateway
+    // left running in another terminal); checked before the log is opened
+    // so two gateways never write to the same storage directory.
+    for (const int port : {config.port, config.consumer_port}) {
+        if (port != 0 && !port_is_free(port)) {
+            cerr << "Port " << port << " is already in use by another process "
+                 << "(is another gateway still running?)\n";
+            return false;
+        }
+    }
     try {
         storage_log.open(config.storage_directory, config.storage_segment_size,
                          config.recent_message_capacity);
