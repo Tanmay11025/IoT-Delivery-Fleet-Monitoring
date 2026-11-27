@@ -494,7 +494,7 @@ HTTP handling, graceful shutdown, and recovery at scale.
 - Fleet Ops dashboard (`dashboard/`) served at `/`.
 - pytest integration and chaos suites, a `wrk` benchmark harness, and GitHub
   Actions CI (Release, ASan/UBSan, Docker HTTP suite).
-- After the fleet work, the suite is 51 C++ CTest cases, 35 pytest cases and
+- After the fleet work, the suite is 51 C++ CTest cases, 38 pytest cases and
   the 13 Docker HTTP cases. See [results.md §6](results.md#6-sustained-throughput-benchmark)
   for throughput numbers.
 

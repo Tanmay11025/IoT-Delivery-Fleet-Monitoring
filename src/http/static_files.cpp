@@ -10,12 +10,13 @@ struct DashboardAsset {
     const char* content_type;
 };
 
-constexpr std::array<DashboardAsset, 5> dashboard_assets{{
+constexpr std::array<DashboardAsset, 6> dashboard_assets{{
     {"index.html", "text/html; charset=utf-8"},
     {"style.css", "text/css; charset=utf-8"},
     {"app.js", "text/javascript; charset=utf-8"},
     {"charts.js", "text/javascript; charset=utf-8"},
     {"fleet_map.js", "text/javascript; charset=utf-8"},
+    {"city_map.json", "application/json"},
 }};
 }  // namespace
 
